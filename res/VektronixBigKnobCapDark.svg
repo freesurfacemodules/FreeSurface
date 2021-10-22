@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- Created with Inkscape (http://www.inkscape.org/) -->
+
+<svg
+   width="15.363215mm"
+   height="15.360279mm"
+   viewBox="0 0 15.363215 15.360279"
+   version="1.1"
+   id="svg537538"
+   inkscape:version="1.2-dev (ac43753, 2021-08-09)"
+   sodipodi:docname="VektronixBigKnobCapDark.svg"
+   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
+   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
+   xmlns:xlink="http://www.w3.org/1999/xlink"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <sodipodi:namedview
+     id="namedview537540"
+     pagecolor="#505050"
+     bordercolor="#ffffff"
+     borderopacity="1"
+     inkscape:pageshadow="0"
+     inkscape:pageopacity="0"
+     inkscape:pagecheckerboard="1"
+     inkscape:document-units="mm"
+     showgrid="false"
+     fit-margin-top="0"
+     fit-margin-left="0"
+     fit-margin-right="0"
+     fit-margin-bottom="0"
+     inkscape:zoom="5.6568543"
+     inkscape:cx="21.38998"
+     inkscape:cy="6.4523494"
+     inkscape:window-width="1627"
+     inkscape:window-height="985"
+     inkscape:window-x="2136"
+     inkscape:window-y="0"
+     inkscape:window-maximized="0"
+     inkscape:current-layer="layer1" />
+  <defs
+     id="defs537535">
+    <linearGradient
+       inkscape:collect="always"
+       xlink:href="#linearGradient11890"
+       id="linearGradient66824"
+       gradientUnits="userSpaceOnUse"
+       gradientTransform="matrix(0.47118954,-0.53705063,0.53705063,0.47118954,-238.54189,-1.8166917)"
+       x1="-29.74379"
+       y1="26.902344"
+       x2="-10.70153"
+       y2="26.902344" />
+    <linearGradient
+       inkscape:collect="always"
+       id="linearGradient11890">
+      <stop
+         style="stop-color:#181212;stop-opacity:1;"
+         offset="0"
+         id="stop11886" />
+      <stop
+         style="stop-color:#382525;stop-opacity:1;"
+         offset="1"
+         id="stop11888" />
+    </linearGradient>
+  </defs>
+  <g
+     inkscape:label="Layer 1"
+     inkscape:groupmode="layer"
+     id="layer1"
+     transform="translate(241.28892,-14.034483)">
+    <path
+       style="color:#000000;fill:url(#linearGradient66824);stroke-width:1.42891;-inkscape-stroke:none;paint-order:markers stroke fill"
+       d="m -229.60762,17.143719 a 6.0879459,6.0879459 45 0 1 0.56122,8.591343 6.0879459,6.0879459 45 0 1 -8.59135,0.561211 6.0879459,6.0879459 45 0 1 -0.5612,-8.591344 6.0879459,6.0879459 45 0 1 8.59133,-0.56121 z"
+       id="path591152" />
+  </g>
+</svg>

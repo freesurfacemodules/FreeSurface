@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- Created with Inkscape (http://www.inkscape.org/) -->
+
+<svg
+   width="5.8373671mm"
+   height="5.8373799mm"
+   viewBox="0 0 5.8373671 5.8373799"
+   version="1.1"
+   id="svg268277"
+   inkscape:version="1.2-dev (ac43753, 2021-08-09)"
+   sodipodi:docname="PinkPort.svg"
+   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
+   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <sodipodi:namedview
+     id="namedview268279"
+     pagecolor="#505050"
+     bordercolor="#ffffff"
+     borderopacity="1"
+     inkscape:pageshadow="0"
+     inkscape:pageopacity="0"
+     inkscape:pagecheckerboard="1"
+     inkscape:document-units="mm"
+     showgrid="false"
+     fit-margin-top="0"
+     fit-margin-left="0"
+     fit-margin-right="0"
+     fit-margin-bottom="0"
+     inkscape:zoom="12.443434"
+     inkscape:cx="25.234191"
+     inkscape:cy="12.737641"
+     inkscape:window-width="1304"
+     inkscape:window-height="1041"
+     inkscape:window-x="2938"
+     inkscape:window-y="32"
+     inkscape:window-maximized="0"
+     inkscape:current-layer="layer1" />
+  <defs
+     id="defs268274" />
+  <g
+     inkscape:label="Layer 1"
+     inkscape:groupmode="layer"
+     id="layer1"
+     transform="translate(-35.184409,-84.5143)">
+    <g
+       id="g161758"
+       transform="translate(47.925249,38.576201)"
+       style="display:inline;mix-blend-mode:normal">
+      <path
+         inkscape:connector-curvature="0"
+         id="path161754"
+         d="m -9.8221549,51.775479 c -1.6095481,0 -2.9186851,-1.30916 -2.9186851,-2.91871 0,-1.60954 1.309137,-2.91867 2.9186851,-2.91867 1.609549,0 2.918682,1.30913 2.918682,2.91867 0,1.60955 -1.309133,2.91871 -2.918682,2.91871"
+         style="fill:#e9afaf;fill-opacity:1;fill-rule:nonzero;stroke:none;stroke-width:0.25;stroke-miterlimit:4;stroke-dasharray:none;stroke-opacity:1" />
+      <path
+         inkscape:connector-curvature="0"
+         id="path161756"
+         d="m -7.6248737,48.856758 c 0,1.213053 -0.984235,2.197309 -2.1972809,2.197309 -1.2130494,0 -2.1972844,-0.984256 -2.1972844,-2.197309 0,-1.21304 0.984235,-2.197247 2.1972844,-2.197247 1.2130459,0 2.1972809,0.984207 2.1972809,2.197247"
+         style="fill:#241c1c;fill-opacity:1;fill-rule:nonzero;stroke:none;stroke-width:0.430708" />
+    </g>
+  </g>
+</svg>

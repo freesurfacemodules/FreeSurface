@@ -1,0 +1,10 @@
+/build
+/dist
+/plugin.dylib
+/dep/lib
+/dep/libsamplerate*
+/dep/bin
+/plugin.dll
+/plugin.so
+plugin-dev.json
+.DS_Store

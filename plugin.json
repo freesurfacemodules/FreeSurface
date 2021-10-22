@@ -1,0 +1,28 @@
+{
+  "slug": "FreeSurface",
+  "version": "1.0.0",
+  "license": "GPL-3.0-only",
+  "name": "Causal Systems",
+  "brand": "Free Surface",
+  "author": "Free Surface",
+  "authorEmail": "freesurfacemodules@gmail.com",
+  "pluginUrl": "",
+  "authorUrl": "",
+  "manualUrl": "",
+  "sourceUrl": "",
+  "changelogUrl": "",
+  "modules": [
+    {
+      "slug": "FreeSurface-Vektronix",
+      "name": "Vektronix",
+      "description": "Vector graphics oscillator. Load an SVG and play back as X-Y waveforms.",
+      "tags": ["Oscillator", "Visual"]
+    },
+    {
+      "slug": "FreeSurface-WaterTable",
+      "name": "WaterTable",
+      "description": "Dynamical system resonator",
+      "tags": ["Distortion", "Filter", "Panning", "Ring modulator", "Physical modeling"]
+    }
+  ]
+}

@@ -1,0 +1,1792 @@
+#define _USE_MATH_DEFINES
+#include "plugin.hpp"
+#include "OpCache.hpp"
+#include "Profiler.hpp"
+#include <math.h>
+
+using simd::float_4;
+using simd::int32_4;
+
+// 2^30 * ln(2)
+#define EXP2_30_TO_EXP 744261117.954893018
+#define ONE_OVER_SQRT_TWO_PI 0.3989422804
+#define SQRT_2 1.41421356237
+
+// must be power-of-two
+#define CHANNEL_SIZE 16
+#define CHANNEL_SIZE_FLOATS (CHANNEL_SIZE << 2)
+#define CHANNEL_MASK (CHANNEL_SIZE - 1)
+
+#define MAX_POSITION (CHANNEL_SIZE * 4.0)
+
+
+// WARNING! This will generate a HUGE amount of data in the log file 
+// when knobs are turned, or CV input is connected to the knob position/sigma
+//#define DEBUG_PROBE_PRINT
+
+// Just disables quadratic bezier interpolation 
+// so we can see the raw output better
+//#define DRAW_DEBUG
+
+struct WaveChannel {
+	enum Model {
+		WAVE_EQUATION,
+		SQUID_AXON,
+		SCHRODINGER,
+		RK4_ADVECTION
+	};
+	Model model;
+
+	/** Member function pointer for the current model.
+	 *  Nasty, but using a switch or inheritance would be nastier 
+	 *  here and probably worse for performance.
+	 */
+	typedef void (WaveChannel::*ModelPointer) (
+		const std::vector<float_4>&, const std::vector<float_4>&, 
+		const std::vector<float_4>&, const std::vector<float_4>&,
+		const std::vector<float_4>&, const std::vector<float_4>&,
+		std::vector<float_4>&, std::vector<float_4>&,
+		const float&, const float&,
+		float&, float&);
+
+	ModelPointer modelPointer;
+
+	float pos_in_L, pos_in_R, amp_in_L, amp_in_R, amp_in_prev_L, amp_in_prev_R, sig_in_L, sig_in_R, pos_out_L, pos_out_R, sig_out_L, sig_out_R;
+	float amp_out_L, amp_out_R = 0.0; 
+	float damping = 0.1; 
+	float timestep = 0.01;
+	float decay = 0.005;
+	float feedback = 0.0;
+	float low_cut = 0.0;
+
+	// ping pong buffer setup
+	bool pong = false;
+
+	bool differential_mode_L = true;
+	bool differential_mode_R = true;
+	bool additive_mode_L = true;
+	bool additive_mode_R = true;
+
+	std::vector<float_4> v_a0 = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
+	std::vector<float_4> v_b0 = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
+	std::vector<float_4> v_a1 = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
+	std::vector<float_4> v_b1 = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
+
+	// temporaries for the model update steps. decreases overhead by declaring them in this scope
+	std::vector<float_4> t_gradient_a = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
+	std::vector<float_4> t_gradient_b = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
+	std::vector<float_4> t_laplacian_a = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
+	std::vector<float_4> t_laplacian_b = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
+
+	// weights for the input and output probes, generated whenever the respective probe settings change
+	std::vector<float_4> input_probe_L_window = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
+	std::vector<float_4> input_probe_R_window = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
+	std::vector<float_4> output_probe_L_window = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
+	std::vector<float_4> output_probe_R_window = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
+
+	WaveChannel() {
+		model = Model::WAVE_EQUATION;
+		modelPointer = &stepWaveEquation;
+	}
+
+	// classic GLSL-style hermite smoothstep function
+	inline float_4 smoothstep(float_4 x) {
+		x = simd::clamp(x, 0., 1.);
+		return x*x*(3. - 2.*x);
+	}
+
+	// smoothstep fit to the error function
+	// https://www.desmos.com/calculator/molpuljtzy
+	inline float_4 smoothstep_erf(float_4 x) {
+		const float P = 0.3761264; //fits a smoothstep to error function with equal first derivative at x=0
+		x = P*x + 0.5;
+		return 2.0 * (smoothstep(x) - 0.5);
+	}
+
+	// smoothstep fit to the derivative of the error function (a gaussian)
+	// https://www.desmos.com/calculator/molpuljtzy
+	inline float_4 smoothstep_erf_deriv(float_4 x) {
+		const float P2 = 1.128379172; //fits a smoothstep to error function first derivative with equal second derivative at x=0
+		const float P3 = 0.577350268;
+
+		x = P3*x;
+		return P2 * (smoothstep(x + 1) - smoothstep(x));
+	}
+
+	/** sign function that doesn't return 0.
+		we need sign to return something other than 0 for x==0 
+		for our signed distance function; the choice of positive 
+		or negative is unimportant here. 
+		the signed distance function will have an erroneous 
+		value at exact integral values of x otherwise. 
+	*/
+	inline float_4 sgnZ(float_4 x) {
+		float_4 signbit = x & -0.f;
+		return signbit | 1.f;
+	}
+
+	// Finds the closest distance from index to comp in a modular space.
+	// INDEX MUST BE IN THE RANGE 0 <= INDEX <= MAX_POSITION
+	inline float_4 wrappedSignedDistance(float_4 index, float_4 comp) {
+		float_4 c0 = simd::fabs(index - comp);
+		float_4 c1 = simd::fabs(index - comp + MAX_POSITION);
+		float_4 c2 = simd::fabs(index - comp - MAX_POSITION);
+		float_4 abs_min = simd::fmin(c0, simd::fmin(c1, c2));
+		float_4 sgn1 = sgnZ(c0 - c1);
+		float_4 sgn2 = sgnZ(c0 - c2);
+		float_4 sgn3 = sgnZ(c1 - c2);
+		return sgn1 * sgn2 * sgn3 * abs_min;
+	}
+
+	// Variation on smoothstep with the max value of the first derivative always <= 1.0
+	// This clamps without also amplifying the signal.
+	inline float_4 smoothclamp(float_4 x, float_4 low, float_4 high) {
+		x = (2./3.) * x;
+		x = simd::clamp((x - low) / (high - low), 0., 1.);
+		return simd::rescale(x*x*(3. - 2.*x),0.,1.,low,high);
+	}
+
+	// Variation on smoothstep with the max value of the first derivative always <= 1.0
+	// This clamps without also amplifying the signal.
+	inline float smoothclamp(float x, float low, float high) {
+		x = (2./3.) * x;
+		x = simd::clamp((x - low) / (high - low), 0., 1.);
+		return simd::rescale(x*x*(3. - 2.*x),0.,1.,low,high);
+	}
+
+	/** computes a gaussian using the differences of the (approximate) error function
+	 *  this is a much better approach than simply sampling a gaussian because we can
+	 *  almost eliminate aliasing, even at small kernel sizes
+	 */
+	inline float_4 approxGaussian(float_4 mean, float_4 x, float_4 sig) {
+		float_4 x_s = wrappedSignedDistance(x, mean);
+		float_4 x_d_l = x_s-0.5;
+		float_4 x_d_r = x_s+0.5;
+		float_4 xsq_l = x_d_l / (SQRT_2*sig);
+		float_4 xsq_r = x_d_r / (SQRT_2*sig);
+		float_4 erf_l = smoothstep_erf(xsq_l);
+		float_4 erf_r = smoothstep_erf(xsq_r);
+		
+		return 0.5*(erf_r-erf_l);
+	}
+
+	/** Same as above, but we get the first derivative of a gaussian using an
+	 *  approximation of the first derivative of the error function.
+	 */
+	inline float_4 approxGaussianDeriv(float_4 mean, float_4 x, float_4 sig) {
+		float_4 x_s = wrappedSignedDistance(x, mean);
+		float_4 x_d_l = x_s-0.5;
+		float_4 x_d_r = x_s+0.5;
+		float_4 xsq_l = x_d_l / (SQRT_2*sig);
+		float_4 xsq_r = x_d_r / (SQRT_2*sig);
+		float_4 erf_l = smoothstep_erf_deriv(xsq_l);
+		float_4 erf_r = smoothstep_erf_deriv(xsq_r);
+		
+		return 0.5*(erf_r-erf_l);
+	}
+
+	
+	/** We need to compute the gradient and laplacian of two float_4 
+	 * 	buffers several times here, so we need to do it as fast as possible.
+	 * 	To do this, each float_4 buffer is circular shifted by one float to
+	 *  the left and one float to the right to get the left and right
+	 *  neighbors needed for the calculation aligned into float_4s.
+	 *  We use hardware shuffle intrinsics to swizzle _m128 float vectors
+	 *  to get left-shifted and right-shifted vectors. After this point,
+	 *  we can do our simple calculations using SIMD ops.
+	*/
+	#define INDEX_MASK static_cast<unsigned int>(CHANNEL_MASK)
+	#define INDEX_MINUS_1 ((index-1) & INDEX_MASK)
+	#define INDEX_PLUS_1 ((index+1) & INDEX_MASK)
+	typedef float v4sf __attribute__ ((vector_size (16)));
+	typedef int v4si __attribute__ ((vector_size (16)));
+	#define V4SF_TO_FLOAT_4(v) float_4(reinterpret_cast<__m128>(v))
+	#define FLOAT_4_TO_V4SF(f) reinterpret_cast<v4sf>(f.v)
+	inline void gradient_and_laplacian(const std::vector<float_4> &x, std::vector<float_4> &grad_out, std::vector<float_4> &lapl_out) {
+		v4si mask_l = {1,2,3,4};
+		v4si mask_r = {3,4,5,6};
+		for (int index = 0; index < CHANNEL_SIZE; index++) {
+			v4sf e = FLOAT_4_TO_V4SF(x[INDEX_PLUS_1]);
+			v4sf w = FLOAT_4_TO_V4SF(x[INDEX_MINUS_1]);
+			v4sf c = FLOAT_4_TO_V4SF(x[index]);
+
+			float_4 shuffle_l = V4SF_TO_FLOAT_4(__builtin_shuffle(c, e, mask_l));
+			float_4 shuffle_r = V4SF_TO_FLOAT_4(__builtin_shuffle(w, c, mask_r));
+
+			grad_out[index] = (shuffle_l - shuffle_r) / 2.0;
+
+			lapl_out[index] = shuffle_l + shuffle_r - 2.0 * x[index];
+		}
+	}
+
+	/** Temporaries for RK4 integration. Declaring them in function scope incurs a huge
+	 *  overhead cost. Some of these (the _half_ vectors) could be reused, but it's not much
+	 *  memory and doing so would make the code significantly more confusing.
+	 */
+	std::vector<float_4> a_grad_1 = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
+	std::vector<float_4> a_half_2 = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
+	std::vector<float_4> a_grad_2 = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
+	std::vector<float_4> a_half_3 = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
+	std::vector<float_4> a_grad_3 = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
+	std::vector<float_4> a_half_4 = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
+	std::vector<float_4> a_grad_4 = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
+
+	std::vector<float_4> b_grad_1 = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
+	std::vector<float_4> b_half_2 = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
+	std::vector<float_4> b_grad_2 = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
+	std::vector<float_4> b_half_3 = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
+	std::vector<float_4> b_grad_3 = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
+	std::vector<float_4> b_half_4 = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
+	std::vector<float_4> b_grad_4 = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
+
+	inline void modelIteration(
+			const std::vector<float_4> &a_in, std::vector<float_4> &delta_a,
+			const std::vector<float_4> &b_in, std::vector<float_4> &delta_b,
+			float &input_L, float &input_R, 
+			float &t_amp_out_L, float &t_amp_out_R,
+			float &amp_sum_out_L, float &amp_sum_out_R) {
+
+		gradient_and_laplacian(a_in, t_gradient_a, t_laplacian_a);
+		gradient_and_laplacian(b_in, t_gradient_b, t_laplacian_b);
+		(this->*modelPointer)(a_in, b_in, t_laplacian_a, t_laplacian_b, 
+		t_gradient_a, t_gradient_b, delta_a, delta_b, 
+		input_L, input_R, t_amp_out_L, t_amp_out_R);
+
+		amp_sum_out_L += t_amp_out_L;
+		amp_sum_out_R += t_amp_out_R;
+
+	}
+
+	/** Runge-Kutta (RK4) integration,
+	 *  used to increase stability at large timesteps
+	 *  and also to upsample our input.
+	 */
+	void RK4_iter(
+			const std::vector<float_4> &a0, const std::vector<float_4> &b0, 
+			std::vector<float_4> &a1, std::vector<float_4> &b1) {
+
+		float amp_sum_out_L = 0.0;
+		float amp_sum_out_R = 0.0;
+		float t_amp_out_L;
+		float t_amp_out_R;
+
+		// Round 1
+		float input_L = feedback * amp_out_L + amp_in_L - low_cut * amp_in_prev_L;
+		float input_R = feedback * amp_out_R + amp_in_R - low_cut * amp_in_prev_R;
+
+		modelIteration( a0, a_grad_1, b0, b_grad_1, input_L, input_R,  
+			t_amp_out_L, t_amp_out_R, amp_sum_out_L, amp_sum_out_R);
+
+		for (int i = 0; i < CHANNEL_SIZE; i++) {
+			smoothclamp(a_half_2[i] = a0[i] + 0.5f * timestep * a_grad_1[i], -10.0, 10.0);
+			smoothclamp(b_half_2[i] = b0[i] + 0.5f * timestep * b_grad_1[i], -10.0, 10.0);
+		}
+
+		// Round 2
+		// input is only non-zero on the first round for simple upsampling
+		input_L = 0.0;
+		input_R = 0.0;
+		
+		modelIteration( a_half_2, a_grad_2, b_half_2, b_grad_2, input_L, input_R,  
+			t_amp_out_L, t_amp_out_R, amp_sum_out_L, amp_sum_out_R);
+
+		for (int i = 0; i < CHANNEL_SIZE; i++) {
+			smoothclamp(a_half_3[i] = a0[i] + 0.5f * timestep * a_grad_2[i], -10.0, 10.0);
+			smoothclamp(b_half_3[i] = b0[i] + 0.5f * timestep * b_grad_2[i], -10.0, 10.0);
+		}
+
+		// Round 3
+		modelIteration( a_half_3, a_grad_3, b_half_3, b_grad_3, input_L, input_R,  
+			t_amp_out_L, t_amp_out_R, amp_sum_out_L, amp_sum_out_R);
+
+		for (int i = 0; i < CHANNEL_SIZE; i++) {
+			smoothclamp(a_half_4[i] = a0[i] + 1.0f * timestep * a_grad_3[i], -10.0, 10.0);
+			smoothclamp(b_half_4[i] = b0[i] + 1.0f * timestep * b_grad_3[i], -10.0, 10.0);
+		}
+
+		// Round 4
+		modelIteration( a_half_4, a_grad_4, b_half_4, b_grad_4, input_L, input_R,  
+			t_amp_out_L, t_amp_out_R, amp_sum_out_L, amp_sum_out_R);
+
+		for (int i = 0; i < CHANNEL_SIZE; i++) {
+			//final result
+			//clamping isn't a part of RK4, but it's more convenient to do it here than elsewhere
+			a1[i] = smoothclamp(a0[i] + timestep * (a_grad_1[i] + 2.0f * a_grad_2[i] + 2.0f * a_grad_3[i] + a_grad_4[i]) / 6.0f, -10.0, 10.0);
+			b1[i] = smoothclamp(b0[i] + timestep * (b_grad_1[i] + 2.0f * b_grad_2[i] + 2.0f * b_grad_3[i] + b_grad_4[i]) / 6.0f, -10.0, 10.0);
+		}
+
+		// clamp to prevent blowups, but with a large range to avoid clipping in general
+		amp_out_L = math::clamp(amp_sum_out_L / 4.0,-100.0f,100.0f);
+		amp_out_R = math::clamp(amp_sum_out_R / 4.0,-100.0f,100.0f);
+
+	}
+
+	// The 3/8s Runge Kutta Method
+	#define INTER_CLAMP(x) smoothclamp((x),-30.0,30.0)
+	void RK4_iter_3_8s(
+			const std::vector<float_4> &a0, const std::vector<float_4> &b0, 
+			std::vector<float_4> &a1, std::vector<float_4> &b1) {
+
+		float amp_sum_out_L = 0.0;
+		float amp_sum_out_R = 0.0;
+		float t_amp_out_L;
+		float t_amp_out_R;
+
+		const float third = 1.0/3.0;
+
+		// Round 1, initial step
+		float input_L = feedback * amp_out_L + amp_in_L - low_cut * amp_in_prev_L;
+		float input_R = feedback * amp_out_R + amp_in_R - low_cut * amp_in_prev_R;
+
+		modelIteration( a0, a_grad_1, b0, b_grad_1, input_L, input_R,  
+			t_amp_out_L, t_amp_out_R, amp_sum_out_L, amp_sum_out_R);
+
+		for (int i = 0; i < CHANNEL_SIZE; i++) {
+			INTER_CLAMP(a_half_2[i] = a0[i] + third * timestep * a_grad_1[i]);
+			INTER_CLAMP(b_half_2[i] = b0[i] + third * timestep * b_grad_1[i]);
+		}
+
+		// Round 2, 1/3 step
+		// input is only non-zero on the first round for simple upsampling
+		input_L = 0.0;
+		input_R = 0.0;
+		
+		modelIteration( a_half_2, a_grad_2, b_half_2, b_grad_2, input_L, input_R,  
+			t_amp_out_L, t_amp_out_R, amp_sum_out_L, amp_sum_out_R);
+
+		for (int i = 0; i < CHANNEL_SIZE; i++) {
+			INTER_CLAMP(a_half_3[i] = a0[i] + timestep * (-third * a_grad_1[i] + a_grad_2[i]));
+			INTER_CLAMP(b_half_3[i] = b0[i] + timestep * (-third * b_grad_1[i] + b_grad_2[i]));
+		}
+
+		// Round 3, 2/3 step
+		modelIteration( a_half_3, a_grad_3, b_half_3, b_grad_3, input_L, input_R,  
+			t_amp_out_L, t_amp_out_R, amp_sum_out_L, amp_sum_out_R);
+
+		for (int i = 0; i < CHANNEL_SIZE; i++) {
+			INTER_CLAMP(a_half_4[i] = a0[i] + timestep * (a_grad_1[i] - a_grad_2[i] + a_grad_3[i]));
+			INTER_CLAMP(b_half_4[i] = b0[i] + timestep * (b_grad_1[i] - b_grad_2[i] + b_grad_3[i]));
+		}
+
+		// Round 4, whole step
+		modelIteration( a_half_4, a_grad_4, b_half_4, b_grad_4, input_L, input_R,  
+			t_amp_out_L, t_amp_out_R, amp_sum_out_L, amp_sum_out_R);
+
+		for (int i = 0; i < CHANNEL_SIZE; i++) {
+			//final result
+			//clamping isn't a part of RK4, but it's more convenie3t to do it here than elsewhere
+			a1[i] = smoothclamp(a0[i] + timestep * (a_grad_1[i] + 3.0f * a_grad_2[i] + 3.0f * a_grad_3[i] + a_grad_4[i]) / 8.0f, -10.0, 10.0);
+			b1[i] = smoothclamp(b0[i] + timestep * (b_grad_1[i] + 3.0f * b_grad_2[i] + 3.0f * b_grad_3[i] + b_grad_4[i]) / 8.0f, -10.0, 10.0);
+		}
+
+		// clamp to prevent blowups, but with a large range to avoid clipping in general
+		amp_out_L = math::clamp(amp_sum_out_L / 4.0,-100.0f,100.0f);
+		amp_out_R = math::clamp(amp_sum_out_R / 4.0,-100.0f,100.0f);
+
+	}
+
+	float sum(float_4 x) {
+		return x[0] + x[1] + x[2] + x[3];
+	}
+
+	void stepWaveEquation(
+		const std::vector<float_4> &a0, const std::vector<float_4> &b0, 
+		const std::vector<float_4> &laplacian_a, const std::vector<float_4> &laplacian_b,
+		const std::vector<float_4> &gradient_a, const std::vector<float_4> &gradient_b,
+		std::vector<float_4> &delta_a, std::vector<float_4> &delta_b,
+		const float &t_input_L, const float &t_input_R,
+		float &t_amp_out_L, float &t_amp_out_R) {
+		
+		float_4 probe_out_L = float_4(0.0);
+		float_4 probe_out_R = float_4(0.0);
+
+		for (int i = 0; i < CHANNEL_SIZE; i++) {
+			float_4 probe_in_L = t_input_L * input_probe_L_window[i];
+			float_4 probe_in_R = t_input_R * input_probe_R_window[i];
+
+			float_4 a = a0[i];
+			float_4 b = b0[i];
+
+			probe_out_L += a * output_probe_L_window[i];
+			probe_out_R += a * output_probe_R_window[i];
+			float_4 summed_probe_input = 
+					(additive_mode_L ? probe_in_L : (a * probe_in_L)) + 
+					(additive_mode_R ? probe_in_R : (a * probe_in_R));
+			delta_a[i] = (summed_probe_input + b + damping * laplacian_a[i] - decay * a);
+			delta_b[i] = (laplacian_a[i] - decay * b);
+		}
+
+		t_amp_out_L = sum(probe_out_L);
+		t_amp_out_R = sum(probe_out_R);
+	}
+
+	void stepSquidAxon(
+		const std::vector<float_4> &a0, const std::vector<float_4> &b0, 
+		const std::vector<float_4> &laplacian_a, const std::vector<float_4> &laplacian_b,
+		const std::vector<float_4> &gradient_a, const std::vector<float_4> &gradient_b,
+		std::vector<float_4> &delta_a, std::vector<float_4> &delta_b,
+		const float &t_input_L, const float &t_input_R,
+		float &t_amp_out_L, float &t_amp_out_R) {
+
+		float_4 probe_out_L = float_4(0.0);
+		float_4 probe_out_R = float_4(0.0);
+
+		for (int i = 0; i < CHANNEL_SIZE; i++) {
+			float_4 probe_in_L = t_input_L * input_probe_L_window[i];
+			float_4 probe_in_R = t_input_R * input_probe_R_window[i];
+
+			float_4 a = simd::clamp(a0[i],-1.0f,1.0f);
+			float_4 b = simd::clamp(b0[i],-1.0f,1.0f);
+
+			probe_out_L += a * output_probe_L_window[i];
+			probe_out_R += a * output_probe_R_window[i];
+
+			// Squid axon
+			const float k1 = 1.0;
+			const float k2 = 0.0;
+			const float k3 = 1.0;
+			float k4 = 0.995+0.1*decay;
+			const float epsilon = 0.1;
+			//#define delta 0.0
+			float delta = 0.5*damping;
+			const float ak0 = -0.1;
+			const float ak1 = 2.0;
+
+			float_4 summed_probe_input_a = 
+					(additive_mode_L ? probe_in_L : (a * probe_in_L)) + 
+					(additive_mode_R ? probe_in_R : (a * probe_in_R));
+			float_4 summed_probe_input_b = 
+					(additive_mode_L ? probe_in_L : (b * probe_in_L)) + 
+					(additive_mode_R ? probe_in_R : (b * probe_in_R));
+			delta_a[i] = summed_probe_input_a + k1*a - k2*a*a - k4*a*a*a - b + (1.0 + delta) * laplacian_a[i];
+			delta_b[i] = - summed_probe_input_b + epsilon*(k3*a - ak1*b - ak0) + delta*laplacian_b[i];
+		}
+
+		t_amp_out_L = sum(probe_out_L);
+		t_amp_out_R = sum(probe_out_R);
+	}
+
+	void stepSchrodinger(
+		const std::vector<float_4> &a0, const std::vector<float_4> &b0, 
+		const std::vector<float_4> &laplacian_a, const std::vector<float_4> &laplacian_b,
+		const std::vector<float_4> &gradient_a, const std::vector<float_4> &gradient_b,
+		std::vector<float_4> &delta_a, std::vector<float_4> &delta_b,
+		const float &t_input_L, const float &t_input_R,
+		float &t_amp_out_L, float &t_amp_out_R) {
+				  			
+		float_4 probe_out_L = float_4(0.0);
+		float_4 probe_out_R = float_4(0.0);
+
+		for (int i = 0; i < CHANNEL_SIZE; i++) {
+			float_4 probe_in_L = t_input_L * input_probe_L_window[i];
+			float_4 probe_in_R = t_input_R * input_probe_R_window[i];
+
+			float_4 a = a0[i];
+			float_4 b = b0[i];
+
+			probe_out_L += a * output_probe_L_window[i];
+			probe_out_R += a * output_probe_R_window[i];
+
+			float_4 summed_probe_input_a = 
+					(additive_mode_L ? probe_in_L : (a * probe_in_L)) + 
+					(additive_mode_R ? probe_in_R : (a * probe_in_R));
+			float_4 summed_probe_input_b = 
+					(additive_mode_L ? probe_in_L : (b * probe_in_L)) + 
+					(additive_mode_R ? probe_in_R : (b * probe_in_R));
+			// Schrodinger equation, with added diffusion and decay
+			// "multiplicative mode" should be considered the physically correct default here
+			delta_a[i] =  (-summed_probe_input_a + - laplacian_b[i] - decay * a + damping * laplacian_a[i]);
+			delta_b[i] = ( summed_probe_input_b + laplacian_a[i] - decay * b + damping * laplacian_b[i]);
+		}
+
+		t_amp_out_L = sum(probe_out_L);
+		t_amp_out_R = sum(probe_out_R);
+	}
+
+	void stepRK4Advection(		
+		const std::vector<float_4> &a0, const std::vector<float_4> &b0, 
+		const std::vector<float_4> &laplacian_a, const std::vector<float_4> &laplacian_b,
+		const std::vector<float_4> &gradient_a, const std::vector<float_4> &gradient_b,
+		std::vector<float_4> &delta_a, std::vector<float_4> &delta_b,
+		const float &t_input_L, const float &t_input_R,
+		float &t_amp_out_L, float &t_amp_out_R) {
+			
+		float_4 probe_out_L = float_4(0.0);
+		float_4 probe_out_R = float_4(0.0);
+
+		float_4 probe_in_R = simd::rescale(t_input_R,-10.0,10.0,-1.0,1.0);
+		float pos_to_mod_offset = 2.0*(pos_in_R - (MAX_POSITION / 2.0)) / MAX_POSITION;
+		probe_in_R = sig_in_R * (probe_in_R + pos_to_mod_offset);
+
+		for (int i = 0; i < CHANNEL_SIZE; i++) {
+			float_4 probe_in_L = t_input_L * input_probe_L_window[i];
+			
+			float_4 a = a0[i];
+
+			probe_out_L += a * output_probe_L_window[i];
+			probe_out_R += a * output_probe_R_window[i];
+
+			// additive mode necessarily works differently here
+			float_4 summed_probe_input_a = 
+					(additive_mode_L ? probe_in_L : (a * probe_in_L));
+			
+			// no multiplicative mode here for right probe, not because 
+			// we can't do it, but because it's incredibly unstable
+			//float_4 summed_probe_input_b = 
+			//		(additive_mode_R ? probe_in_R : (a * probe_in_R));
+
+			// gradients are smoothclamped for stability
+			delta_a[i] = smoothclamp((summed_probe_input_a + damping * laplacian_a[i] - decay * a)  // input
+					- probe_in_R * gradient_a[i], -10.0f, 10.0f); // advection
+
+		}
+
+		t_amp_out_L = sum(probe_out_L);
+		t_amp_out_R = sum(probe_out_R);
+	}
+
+	void setParams(float damping, float timestep, float decay, float low_cut, float feedback) {
+		this->damping = damping;
+		this->timestep = timestep;
+		this->decay = decay;
+		this->low_cut = low_cut;
+		this->feedback = feedback;
+	}
+
+	bool input_probe_L_dirty = true;
+	bool input_probe_R_dirty = true;
+	bool output_probe_L_dirty = true;
+	bool output_probe_R_dirty = true;
+	bool dirty_init = true;
+
+	void setDirtyProbe(bool& dirty_flag, const float& pos_prev, const float& sig_prev, const float& pos_next, const float& sig_next) {
+		dirty_flag = (pos_prev != pos_next || sig_prev != sig_next);
+	}
+
+	// Generate and normalize probe window buffers
+	void generateProbeWindow(std::vector<float_4> &w, bool isDirty, float pos, float sigma, bool deriv) {
+		if (isDirty || dirty_init) {
+			float_4 w_sum = float_4(0.0);
+			for (int i = 0; i < CHANNEL_SIZE; i++) {
+				float_4 f_i = float_4(4.0*i, 4.0*i+1.0, 4.0*i+2.0, 4.0*i+3.0);
+				if (deriv) {
+					w[i] = approxGaussianDeriv(pos, f_i, sigma);
+					w_sum += simd::abs(w[i]);
+				} else {
+					w[i] = approxGaussian(pos, f_i, sigma);
+					w_sum += w[i];
+				}
+			}
+			float w_norm = sum(w_sum);
+			if (deriv) {
+				w_norm *= 0.5;
+			}
+			for (int i = 0; i < CHANNEL_SIZE; i++) {
+				w[i] /= w_norm;
+			}
+
+			#ifdef DEBUG_PROBE_PRINT
+				// WARNING! This will generate a HUGE amount of data in the log file 
+				// when knobs are turned, or CV input is connected to the knob position/sigma
+				std::string debug_string;
+				for (auto f : w) {
+					debug_string += std::to_string(f[0]) + " " + std::to_string(f[1]) + " " + std::to_string(f[2]) + " " + std::to_string(f[3]) + " ";
+				}
+				debug_string = "probe_generated: " + debug_string;
+				INFO(debug_string.c_str());
+			#endif
+			dirty_init = false;
+		}
+	}
+
+	// Probe window buffers are only updated when the inputs change to save on computation cost.
+	void setProbeSettings(float pos_in_L, float pos_in_R, float pos_out_L, float pos_out_R, float sig_in_L, float sig_in_R, float sig_out_L, float sig_out_R) {
+		setDirtyProbe(input_probe_L_dirty, this->pos_in_L, this->sig_in_L, pos_in_L, sig_in_L);
+		setDirtyProbe(input_probe_R_dirty, this->pos_in_R, this->sig_in_R, pos_in_R, sig_in_R);
+		setDirtyProbe(output_probe_L_dirty, this->pos_out_L, this->sig_out_L, pos_out_L, sig_out_L);
+		setDirtyProbe(output_probe_R_dirty, this->pos_out_R, this->sig_out_R, pos_out_R, sig_out_R);
+		this->pos_in_L = pos_in_L;
+		this->pos_in_R = pos_in_R;
+		this->sig_in_L = sig_in_L;
+		this->sig_in_R = sig_in_R;
+		this->pos_out_L = pos_out_L;
+		this->pos_out_R = pos_out_R;
+		this->sig_out_L = sig_out_L;
+		this->sig_out_R = sig_out_R;
+		generateProbeWindow(input_probe_L_window, input_probe_L_dirty, this->pos_in_L, this->sig_in_L, differential_mode_L);
+		generateProbeWindow(input_probe_R_window, input_probe_R_dirty, this->pos_in_R, this->sig_in_R, differential_mode_R);
+		generateProbeWindow(output_probe_L_window, output_probe_L_dirty, this->pos_out_L, this->sig_out_L, false);
+		generateProbeWindow(output_probe_R_window, output_probe_R_dirty, this->pos_out_R, this->sig_out_R, false);
+	}
+
+	void toggleAdditiveModeL() {
+		additive_mode_L = !additive_mode_L;
+	}
+
+	void toggleAdditiveModeR() {
+		additive_mode_R = !additive_mode_R;
+	}
+
+	void toggleDifferentialModeL() {
+		differential_mode_L = !differential_mode_L;
+		generateProbeWindow(input_probe_L_window, true, this->pos_in_L, this->sig_in_L, differential_mode_L);
+	}
+
+	void toggleDifferentialModeR() {
+		differential_mode_R = !differential_mode_R;
+		generateProbeWindow(input_probe_R_window, true, this->pos_in_R, this->sig_in_R, differential_mode_R);
+	}
+
+
+	void setProbeInputs(float amp_in_L, float amp_in_R) {
+		this->amp_in_prev_L = this->amp_in_L;
+		this->amp_in_prev_R = this->amp_in_R;
+		this->amp_in_L = amp_in_L;
+		this->amp_in_R = amp_in_R;
+	}
+
+	void setNextModel() {
+		switch(this->model) {
+			case WAVE_EQUATION:
+				this->model = Model::SQUID_AXON;
+				this->modelPointer = &stepSquidAxon;
+				break;
+			case SQUID_AXON:
+				this->model = Model::SCHRODINGER;
+				this->modelPointer = &stepSchrodinger;
+				break;
+			case SCHRODINGER:
+				this->model = Model::RK4_ADVECTION;
+				this->modelPointer = &stepRK4Advection;
+				break;
+			case RK4_ADVECTION:
+				this->model = Model::WAVE_EQUATION;
+				this->modelPointer = &stepWaveEquation;
+				break;
+		}
+	}
+
+	float getAmpOutL() {
+		return amp_out_L;
+	}
+
+	float getAmpOutR() {
+		return amp_out_R;
+	}
+
+	// Update the ping-pong buffers
+	void update() {
+		if (pong) {
+			RK4_iter_3_8s(v_a0, v_b0, v_a1, v_b1);
+		} else {
+			RK4_iter_3_8s(v_a1, v_b1, v_a0, v_b0);
+		}
+		pong = !pong;
+	}
+
+};
+
+
+struct StereoDCBiasRemover {
+	float L, R = 0.0;
+	float decay = 0.0001;
+	void remove(float & in_L, float & in_R) {
+		L  = simd::crossfade(L, in_L, decay);
+		R  = simd::crossfade(R, in_R, decay);
+		in_L = in_L - L;
+		in_R = in_R - R;
+	}
+	void reset() {
+		L = 0.;
+		R = 0.;
+	}
+};
+
+struct FixedTimeExpSlewLimiter {
+	float val = 0.0;
+	float decay;
+	bool init = true;
+	FixedTimeExpSlewLimiter() : decay(0.1f) {}
+	FixedTimeExpSlewLimiter(float _decay) : decay(_decay) {}
+	void limit(float &in) {
+		if (init) {
+			init = false;
+			val = in;
+		} else {
+			val  = simd::crossfade(val, in, decay);
+			in = val;
+		}
+	}
+	void reset() {
+		val = 0.;
+		init = true;
+	}
+};
+
+template <size_t PARAM, size_t INPUT_CV, size_t PARAM_CV>
+struct CVParamInput {
+	Module* module;
+	std::string json_label;
+	float min;
+	float max;
+	float shift; // for pitch conversion where the tone generator needs to be tuned
+	enum ParamType {
+		Default,
+		Modulo,
+		Exponential,
+		Pitch
+	} paramType;
+
+	float paramCacheIn;
+	float paramCacheOut;
+	bool init = true;
+	CVParamInput() {}
+
+	void config(Module* module, float min, float max, float def, std::string json_label, std::string label = "", std::string unit = "", float displayBase = 0.f, float displayMultiplier = 1.f, float displayOffset = 0.f) {
+		module->configParam(PARAM, min, max, def, label, unit, displayBase, displayMultiplier, displayOffset);
+		module->configParam(PARAM_CV, -1.0, 1.0, 0.0, label + " CV");
+		this->json_label = json_label;
+		this->module = module;
+		this->min = min;
+		this->max = max;
+		this->paramType = ParamType::Default;
+	}
+
+	void configModulo(Module* module, float max, float def, std::string json_label, std::string label = "", std::string unit = "", float displayBase = 0.f, float displayMultiplier = 1.f, float displayOffset = 0.f) {
+		module->configParam(PARAM, -HUGE_VALF, HUGE_VALF, def, label, unit, displayBase, displayMultiplier, displayOffset);
+		module->configParam(PARAM_CV, -1.0, 1.0, 0.0, label + " CV");
+		this->json_label = json_label;
+		this->module = module;
+		this->min = 0.0;
+		this->max = max;
+		this->paramType = ParamType::Modulo;
+	}
+
+	void configExp(Module* module, float min, float max, float def, std::string json_label, std::string label = "", std::string unit = "", float displayBase = 0.f, float displayMultiplier = 1.f, float displayOffset = 0.f) {
+		module->configParam(PARAM, min, max, def, label, unit, displayBase, displayMultiplier, displayOffset);
+		module->configParam(PARAM_CV, -1.0, 1.0, 0.0, label + " CV");
+		this->json_label = json_label;
+		this->module = module;
+		this->min = min;
+		this->max = max;
+		this->paramType = ParamType::Exponential;
+	}
+
+	void configPitch(Module* module, float shift, float param_min, float param_max, float val_max, float def, std::string json_label, std::string label = "", std::string unit = "", float displayBase = 0.f, float displayMultiplier = 1.f, float displayOffset = 0.f) {
+		module->configParam(PARAM, param_min, param_max, def, label, unit, displayBase, displayMultiplier, displayOffset);
+		module->configParam(PARAM_CV, -1.0, 1.0, 0.0, label + " CV");
+		this->json_label = json_label;
+		this->module = module;
+		this->min = 0.0;
+		this->max = val_max;
+		this->shift = shift;
+		this->paramType = ParamType::Pitch;
+	}
+
+	float getExpValue(float cv, float param, float input) {
+		// Get gain
+		float gain_param = simd::rescale(param, min, max, -1.0, 1.0);
+
+		float gain = simd::clamp(gain_param + cv * input, -1.0, 1.0);
+		
+		float res;
+		if (init || paramCacheIn != gain) {
+			init = false;
+			paramCacheIn = gain;
+			res = simd::rescale(std::pow(2.0, gain * 8.f), 0.00390625, 256.0, min, max); // scale from (2^-8, 2^8) to (min, max)
+			paramCacheOut = res;
+		}
+
+		return paramCacheOut;
+	}
+
+	float getPitchValue(float cv, float param, float input) {
+		// Get gain
+		input = simd::rescale(input, -1.0, 1.0, -5.0, 5.0); // hacky
+
+		float gain = simd::clamp(shift + param + cv * input, -8.5, 8.5);
+		
+		float res;
+		if (init || paramCacheIn != gain) {
+			init = false;
+			paramCacheIn = gain;
+			res = max * std::pow(2.0, gain) / 256.0; // scale from 2^8 to max
+			paramCacheOut = res;
+		}
+
+		return paramCacheOut;
+	}
+
+	float getValue() {
+		float input = simd::rescale(module->inputs[INPUT_CV].getVoltage(0), -5.0, 5.0, -1.0, 1.0);
+		float cv = module->params[PARAM_CV].getValue();
+		float param = module->params[PARAM].getValue();
+		switch(paramType) {
+			case Modulo:
+				return math::eucMod(max / 2.0 * param + cv * max * input, max);
+				break;
+			case Exponential:
+				return getExpValue(cv, param, input);
+				break;
+			case Pitch:
+				return getPitchValue(cv, param, input);
+				break;
+			default:
+				return simd::clamp(param + cv * (max - min) * input, min, max);
+				break;
+		}
+	}
+
+	float getParamKnob() {
+		return module->params[PARAM].getValue();
+	}
+
+	void setParamKnob(float val) {
+		module->params[PARAM].setValue(val);
+	}
+
+	void dataToJson(json_t* rootJ) {
+		json_object_set_new(rootJ, json_label.c_str(), json_real(getParamKnob()));
+	}
+
+	void dataFromJson(json_t* rootJ) {
+		json_t* j_val = json_object_get(rootJ, json_label.c_str());
+		if (j_val)
+			setParamKnob(json_real_value(j_val));
+	}
+};
+
+
+struct WaterTable : Module {
+	enum ParamIds {
+		MODEL_BUTTON_PARAM,
+		DIFFERENTIAL_BUTTON_L_PARAM,
+		MULTIPLICATIVE_BUTTON_L_PARAM,
+		DIFFERENTIAL_BUTTON_R_PARAM,
+		MULTIPLICATIVE_BUTTON_R_PARAM,
+		POSITION_IN_L_PARAM,
+		POSITION_IN_R_PARAM,
+		POSITION_IN_L_CV_PARAM,
+		POSITION_IN_R_CV_PARAM,
+		PROBE_SIGMA_IN_L_PARAM,
+		PROBE_SIGMA_IN_R_PARAM,
+		PROBE_SIGMA_IN_L_CV_PARAM,
+		PROBE_SIGMA_IN_R_CV_PARAM,
+		POSITION_OUT_L_PARAM,
+		POSITION_OUT_R_PARAM,
+		POSITION_OUT_L_CV_PARAM,
+		POSITION_OUT_R_CV_PARAM,
+		PROBE_SIGMA_OUT_L_PARAM,
+		PROBE_SIGMA_OUT_R_PARAM,
+		PROBE_SIGMA_OUT_L_CV_PARAM,
+		PROBE_SIGMA_OUT_R_CV_PARAM,
+		DAMPING_CV_PARAM,
+		TIMESTEP_CV_PARAM,
+		DECAY_CV_PARAM,
+		FEEDBACK_CV_PARAM,
+		LOW_CUT_CV_PARAM,
+		INPUT_GAIN_L_CV_PARAM,
+		INPUT_GAIN_R_CV_PARAM,
+		DRY_CV_PARAM,
+		WET_CV_PARAM,
+		DAMPING_PARAM,
+		TIMESTEP_PARAM,
+		DECAY_PARAM,
+		FEEDBACK_PARAM,
+		LOW_CUT_PARAM,
+		INPUT_GAIN_L_PARAM,
+		INPUT_GAIN_R_PARAM,
+		DRY_PARAM,
+		WET_PARAM,
+		NUM_PARAMS
+	};
+	enum InputIds {
+		PROBE_IN_L_INPUT,
+		PROBE_IN_R_INPUT,
+		PROBE_POSITION_IN_L_INPUT,
+		PROBE_POSITION_IN_R_INPUT,
+		PROBE_SIGMA_IN_L_INPUT,
+		PROBE_SIGMA_IN_R_INPUT,
+		PROBE_POSITION_OUT_L_INPUT,
+		PROBE_POSITION_OUT_R_INPUT,
+		PROBE_SIGMA_OUT_L_INPUT,
+		PROBE_SIGMA_OUT_R_INPUT,
+		DAMPING_INPUT,
+		TIMESTEP_INPUT,
+		DECAY_INPUT,
+		FEEDBACK_INPUT,
+		LOW_CUT_INPUT,
+		INPUT_GAIN_L_INPUT,
+		INPUT_GAIN_R_INPUT,
+		DRY_INPUT,
+		WET_INPUT,
+		NUM_INPUTS
+	};
+	enum OutputIds {
+		PROBE_OUT_L_OUTPUT,
+		PROBE_OUT_R_OUTPUT,
+		NUM_OUTPUTS
+	};
+	enum LightIds {
+		EOC_LIGHT,
+		INTEGRAL_L_LIGHT,
+		ADDITIVE_L_LIGHT,
+		DIFFERENTIAL_L_LIGHT,
+		MULTIPLICATIVE_L_LIGHT,
+		INTEGRAL_R_LIGHT,
+		ADDITIVE_R_LIGHT,
+		DIFFERENTIAL_R_LIGHT,
+		MULTIPLICATIVE_R_LIGHT,
+		POS_MODE_LIGHT,
+		MOD_MODE_LIGHT,
+		NUM_LIGHTS
+	};
+
+	WaveChannel waveChannel;
+	StereoDCBiasRemover dcBias;
+	FixedTimeExpSlewLimiter timestepSlewLimiter;
+	dsp::ClockDivider lightDivider;
+
+	CVParamInput<POSITION_IN_L_PARAM,  PROBE_POSITION_IN_L_INPUT,  POSITION_IN_L_CV_PARAM> pos_in_L_param;
+	CVParamInput<POSITION_IN_R_PARAM,  PROBE_POSITION_IN_R_INPUT,  POSITION_IN_R_CV_PARAM> pos_in_R_param;
+	CVParamInput<POSITION_OUT_L_PARAM, PROBE_POSITION_OUT_L_INPUT, POSITION_OUT_L_CV_PARAM> pos_out_L_param;
+	CVParamInput<POSITION_OUT_R_PARAM, PROBE_POSITION_OUT_R_INPUT, POSITION_OUT_R_CV_PARAM> pos_out_R_param;
+
+	CVParamInput<PROBE_SIGMA_IN_L_PARAM, PROBE_SIGMA_IN_L_INPUT, PROBE_SIGMA_IN_L_CV_PARAM> sig_in_L_param;
+	CVParamInput<PROBE_SIGMA_IN_R_PARAM, PROBE_SIGMA_IN_R_INPUT, PROBE_SIGMA_IN_R_CV_PARAM> sig_in_R_param;
+	CVParamInput<PROBE_SIGMA_OUT_L_PARAM, PROBE_SIGMA_OUT_L_INPUT, PROBE_SIGMA_OUT_L_CV_PARAM> sig_out_L_param;
+	CVParamInput<PROBE_SIGMA_OUT_R_PARAM, PROBE_SIGMA_OUT_R_INPUT, PROBE_SIGMA_OUT_R_CV_PARAM> sig_out_R_param;
+
+	CVParamInput<INPUT_GAIN_L_PARAM,  INPUT_GAIN_L_INPUT,   INPUT_GAIN_L_CV_PARAM> input_gain_L_param;
+	CVParamInput<INPUT_GAIN_R_PARAM,  INPUT_GAIN_R_INPUT,   INPUT_GAIN_R_CV_PARAM> input_gain_R_param;
+
+	CVParamInput<DAMPING_PARAM,  DAMPING_INPUT,   DAMPING_CV_PARAM> damping_param;
+	CVParamInput<TIMESTEP_PARAM, TIMESTEP_INPUT,  TIMESTEP_CV_PARAM> timestep_param;
+	CVParamInput<DECAY_PARAM,    DECAY_INPUT,     DECAY_CV_PARAM> decay_param;
+	CVParamInput<FEEDBACK_PARAM, FEEDBACK_INPUT,  FEEDBACK_CV_PARAM> feedback_param;
+	CVParamInput<LOW_CUT_PARAM,  LOW_CUT_INPUT,   LOW_CUT_CV_PARAM> low_cut_param;
+	//CVParamInput<INPUT_GAIN_PARAM,  INPUT_GAIN_INPUT,   INPUT_GAIN_CV_PARAM> input_gain_param;
+	CVParamInput<DRY_PARAM,  DRY_INPUT,   DRY_CV_PARAM> dry_param;
+	CVParamInput<WET_PARAM,  WET_INPUT,   WET_CV_PARAM> wet_param;
+	
+	#define PROBE_SIGMA_MIN 0.25
+	#define PROBE_SIGMA_MAX 4.0
+	#define PROBE_SIGMA_DEF 1.0
+
+	#define LOW_CUT_MIN 0.0
+	#define LOW_CUT_MAX 1.0
+	#define LOW_CUT_DEF 0.0
+
+	#define DAMPING_MIN 0.0
+	#define DAMPING_MAX 0.95
+	#define DAMPING_DEF 0.5
+
+	#define DECAY_MIN 0.0
+	#define DECAY_MAX 0.5
+	#define DECAY_DEF 0.002
+
+	#define TIMESTEP_SHIFT 3.191
+	#define TIMESTEP_MAX 0.4
+	#define TIMESTEP_KNOB_MIN -8.0
+	#define TIMESTEP_KNOB_MAX 8.0
+	#define TIMESTEP_DEF 0.0
+
+	#define FEEDBACK_MIN -8.0
+	#define FEEDBACK_MAX 8.0
+	#define FEEDBACK_DEF 0.0
+	WaterTable() : timestepSlewLimiter(0.02f) {
+		
+		config(NUM_PARAMS, NUM_INPUTS, NUM_OUTPUTS, NUM_LIGHTS);
+		pos_in_L_param.configModulo(this, MAX_POSITION, 0.0, "pos_in_L", "Left Input Probe Position");
+		pos_out_L_param.configModulo(this, MAX_POSITION, 0.5, "pos_out_L", "Left Output Probe Position");
+		pos_in_R_param.configModulo(this, MAX_POSITION, 1.0, "pos_in_R", "Right Input Probe Position");
+		pos_out_R_param.configModulo(this, MAX_POSITION, 1.5, "pos_out_R", "Right Output Probe Position");
+		sig_in_L_param.config(this, PROBE_SIGMA_MIN, PROBE_SIGMA_MAX, PROBE_SIGMA_DEF, "sig_in_L", "Left Input Probe Width");
+		sig_out_L_param.config(this, PROBE_SIGMA_MIN, PROBE_SIGMA_MAX, PROBE_SIGMA_DEF, "sig_out_L", "Left Output Probe Width");
+		sig_in_R_param.config(this, PROBE_SIGMA_MIN, PROBE_SIGMA_MAX, PROBE_SIGMA_DEF, "sig_in_R", "Right Input Probe Width");
+		sig_out_R_param.config(this, PROBE_SIGMA_MIN, PROBE_SIGMA_MAX, PROBE_SIGMA_DEF, "sig_out_R", "Right Output Probe Width");
+		damping_param.configExp(this, DAMPING_MIN, DAMPING_MAX, DAMPING_DEF, "damping", "Damping");
+		timestep_param.configPitch(this, TIMESTEP_SHIFT, TIMESTEP_KNOB_MIN, TIMESTEP_KNOB_MAX, TIMESTEP_MAX, TIMESTEP_DEF, "timestep", "Timestep");
+		decay_param.configExp(this, DECAY_MIN, DECAY_MAX, DECAY_DEF, "decay", "Decay");
+		feedback_param.config(this, FEEDBACK_MIN, FEEDBACK_MAX, FEEDBACK_DEF, "feedback", "Feedback");
+		low_cut_param.config(this, LOW_CUT_MIN, LOW_CUT_MAX, LOW_CUT_DEF, "low_cut", "Low Cut");
+		//input_gain_param.config(this, 0.0, 8.0, 1.0, "Input Gain");
+		input_gain_L_param.configExp(this, 0.0, 8.0, 6.0, "input_gain_L", "Input Gain L");
+		input_gain_R_param.configExp(this, 0.0, 8.0, 6.0, "input_gain_R", "Input Gain R");
+		dry_param.configExp(this, 0.0, 8.0, 0.0, "dry", "Dry Gain");
+		wet_param.configExp(this, 0.0, 8.0, 6.0, "wet", "Wet Gain");
+		lightDivider.setDivision(16);
+	}
+
+	bool anyOutputsConnected() {
+		return outputs[PROBE_OUT_L_OUTPUT].isConnected() || outputs[PROBE_OUT_R_OUTPUT].isConnected();
+	}
+
+	void setNextModel() {
+		waveChannel.setNextModel();
+	}
+
+	void process(const ProcessArgs& args) override {
+		float pos_in_L = pos_in_L_param.getValue();
+		float pos_in_R = pos_in_R_param.getValue();
+		float sig_in_L = sig_in_L_param.getValue();
+		float sig_in_R = sig_in_R_param.getValue();
+		float pos_out_L = pos_out_L_param.getValue();
+		float pos_out_R = pos_out_R_param.getValue();
+		float sig_out_L = sig_out_L_param.getValue();
+		float sig_out_R = sig_out_R_param.getValue();
+		float damping = damping_param.getValue();
+		float timestep = timestep_param.getValue();
+		// volume is basically proportional to the square root of timestep,
+		// so we slew limit timestep to prevent clicking, 
+		// and later divide the final amplitude through by sqrt(timestep)
+		timestepSlewLimiter.limit(timestep);
+		float decay = decay_param.getValue();
+		float feedback = feedback_param.getValue();
+		float low_cut = low_cut_param.getValue();
+		
+		//float sample_rate_scale = 44100.0f / args.sampleRate;
+
+		float amp_in_L = inputs[PROBE_IN_L_INPUT].getVoltage(0);
+		float amp_in_R = inputs[PROBE_IN_R_INPUT].getVoltage(0);
+
+		float amp_out_L = 0.;
+		float amp_out_R = 0.;
+		if (anyOutputsConnected()) {
+			waveChannel.setParams(damping, timestep, decay, low_cut, feedback);
+			waveChannel.setProbeSettings(pos_in_L, pos_in_R, pos_out_L, pos_out_R, sig_in_L, sig_in_R, sig_out_L, sig_out_R);
+			waveChannel.setProbeInputs(input_gain_L_param.getValue() * amp_in_L, input_gain_R_param.getValue() * amp_in_R);
+			//waveChannel.setSampleRate(args.sampleRate);
+			waveChannel.update();
+			amp_out_L = waveChannel.getAmpOutL();
+			amp_out_R = waveChannel.getAmpOutR();
+			dcBias.remove(amp_out_L, amp_out_R);
+			float ts_curved = simd::sqrt(timestep);
+			amp_out_L *= (wet_param.getValue() / ts_curved);
+			amp_out_R *= (wet_param.getValue() / ts_curved);
+			//amp_out_L *= wet_param.getValue();
+			//amp_out_R *= wet_param.getValue();
+		}
+
+		if (outputs[PROBE_OUT_L_OUTPUT].isConnected()) {
+			outputs[PROBE_OUT_L_OUTPUT].setVoltage(dry_param.getValue() * amp_in_L + amp_out_L, 0);
+		}
+
+		if (outputs[PROBE_OUT_R_OUTPUT].isConnected()) {
+			outputs[PROBE_OUT_R_OUTPUT].setVoltage(dry_param.getValue() * amp_in_R + amp_out_R, 0);
+		}
+		
+
+		outputs[PROBE_OUT_L_OUTPUT].setChannels(1);
+		outputs[PROBE_OUT_R_OUTPUT].setChannels(1);
+
+
+		// Light
+		if (lightDivider.process()) {
+				float lightValue = amp_out_L;
+				lights[EOC_LIGHT].setSmoothBrightness(lightValue, args.sampleTime * lightDivider.getDivision());
+
+				float pos_light = 0.0;
+				float mod_light = 0.0;
+				bool disable_R_diff_add_lights = false;
+				switch(waveChannel.model) {
+					case WaveChannel::Model::RK4_ADVECTION:
+						pos_light = 0.0; mod_light = 1.0; 
+						disable_R_diff_add_lights = true;
+						break;
+					default:
+						pos_light = 1.0; mod_light = 0.0; 
+						disable_R_diff_add_lights = false;
+						break;
+				}
+
+				float diff_light_l = waveChannel.differential_mode_L ? 1.0 : 0.0;
+				float int_light_l = waveChannel.differential_mode_L ? 0.0 : 1.0;
+				float add_light_l = waveChannel.additive_mode_L ? 1.0 : 0.0;
+				float mult_light_l = waveChannel.additive_mode_L ? 0.0 : 1.0;
+
+				float add_light_r;
+				float mult_light_r;
+				float diff_light_r;
+				float int_light_r;
+				if (disable_R_diff_add_lights) {
+					add_light_r = 0.0;
+					mult_light_r = 0.0;
+					diff_light_r = 0.0;
+					int_light_r = 0.0;
+				} else {
+					add_light_r = waveChannel.additive_mode_R ? 1.0 : 0.0;
+					mult_light_r = waveChannel.additive_mode_R ? 0.0 : 1.0;
+					diff_light_r = waveChannel.differential_mode_R ? 1.0 : 0.0;
+					int_light_r = waveChannel.differential_mode_R ? 0.0 : 1.0;
+				}
+
+				lights[POS_MODE_LIGHT].setBrightness(pos_light);
+				lights[MOD_MODE_LIGHT].setBrightness(mod_light);
+
+				lights[DIFFERENTIAL_L_LIGHT].setBrightness(diff_light_l);
+				lights[INTEGRAL_L_LIGHT].setBrightness(int_light_l);
+				lights[DIFFERENTIAL_R_LIGHT].setBrightness(diff_light_r);
+				lights[INTEGRAL_R_LIGHT].setBrightness(int_light_r);
+
+				lights[ADDITIVE_L_LIGHT].setBrightness(add_light_l);
+				lights[MULTIPLICATIVE_L_LIGHT].setBrightness(mult_light_l);
+				lights[ADDITIVE_R_LIGHT].setBrightness(add_light_r);
+				lights[MULTIPLICATIVE_R_LIGHT].setBrightness(mult_light_r);
+
+				lights[POS_MODE_LIGHT].setBrightness(pos_light);
+				lights[MOD_MODE_LIGHT].setBrightness(mod_light);
+		}
+	}
+
+	void booleanFromJson(json_t* rootJ, bool &val, const char* json_label) {
+		json_t* j_val = json_object_get(rootJ, json_label);
+		if (j_val)
+			val = json_boolean_value(j_val);
+	}
+
+	void booleanToJson(json_t* rootJ, bool &val, const char* json_label) {
+		json_object_set_new(rootJ, json_label, json_boolean(val));
+	}
+
+	void modelFromJson(json_t* rootJ, WaveChannel::Model &val, const char* json_label) {
+		json_t* j_val = json_object_get(rootJ, json_label);
+		if (j_val)
+			val = static_cast<WaveChannel::Model>(json_integer_value(j_val));
+	}
+
+	void modelToJson(json_t* rootJ, WaveChannel::Model &val, const char* json_label) {
+		json_object_set_new(rootJ, json_label, json_integer(static_cast<int>(val)));
+	}
+
+	json_t* dataToJson() override {
+		json_t* rootJ = json_object();
+		pos_in_L_param.dataToJson(rootJ);
+		pos_in_R_param.dataToJson(rootJ);
+		pos_out_L_param.dataToJson(rootJ);
+		pos_out_R_param.dataToJson(rootJ);
+		booleanToJson(rootJ, waveChannel.differential_mode_L, "differential_mode_L");
+		booleanToJson(rootJ, waveChannel.differential_mode_R, "differential_mode_R");
+		booleanToJson(rootJ, waveChannel.additive_mode_L, "additive_mode_L");
+		booleanToJson(rootJ, waveChannel.additive_mode_R, "additive_mode_R");
+		modelToJson(rootJ, waveChannel.model, "model");
+		return rootJ;
+	}
+
+	void dataFromJson(json_t* rootJ) override {
+		pos_in_L_param.dataFromJson(rootJ);
+		pos_in_R_param.dataFromJson(rootJ);
+		pos_out_L_param.dataFromJson(rootJ);
+		pos_out_R_param.dataFromJson(rootJ);
+		booleanFromJson(rootJ, waveChannel.differential_mode_L, "differential_mode_L");
+		booleanFromJson(rootJ, waveChannel.differential_mode_R, "differential_mode_R");
+		booleanFromJson(rootJ, waveChannel.additive_mode_L, "additive_mode_L");
+		booleanFromJson(rootJ, waveChannel.additive_mode_R, "additive_mode_R");
+		modelFromJson(rootJ, waveChannel.model, "model");
+	}
+};
+
+struct WaterTableModeButton : FreeSurfaceLogoToggleDark {
+    WaterTable* module;
+    WaterTableModeButton() {
+        this->momentary = true;
+    }
+
+    void onButton(const event::Button& e) override {
+		//ParamWidget::onButton(e);
+
+        e.stopPropagating();
+		if (!module) {
+			return;
+        }
+
+		if (e.action == GLFW_PRESS && (e.button == GLFW_MOUSE_BUTTON_LEFT || e.button == GLFW_MOUSE_BUTTON_RIGHT)) {
+            module->setNextModel();
+			e.consume(this);
+		}
+	}
+};
+
+struct WaterTableAdditiveModeLToggle : VektronixToggleDark {
+    WaterTable* module;
+    WaterTableAdditiveModeLToggle() {
+        this->momentary = true;
+    }
+
+    void onButton(const event::Button& e) override {
+        e.stopPropagating();
+		if (!module) {
+			return;
+        }
+
+		if (e.action == GLFW_PRESS && (e.button == GLFW_MOUSE_BUTTON_LEFT || e.button == GLFW_MOUSE_BUTTON_RIGHT)) {
+            module->waveChannel.toggleAdditiveModeL();
+			e.consume(this);
+		}
+	}
+};
+
+struct WaterTableAdditiveModeRToggle : VektronixToggleDark {
+    WaterTable* module;
+    WaterTableAdditiveModeRToggle() {
+        this->momentary = true;
+    }
+
+    void onButton(const event::Button& e) override {
+        e.stopPropagating();
+		if (!module) {
+			return;
+        }
+
+		if (e.action == GLFW_PRESS && (e.button == GLFW_MOUSE_BUTTON_LEFT || e.button == GLFW_MOUSE_BUTTON_RIGHT)) {
+            module->waveChannel.toggleAdditiveModeR();
+			e.consume(this);
+		}
+	}
+};
+
+struct WaterTableDifferentialModeLToggle : VektronixToggleDark {
+    WaterTable* module;
+    WaterTableDifferentialModeLToggle() {
+        this->momentary = true;
+    }
+
+    void onButton(const event::Button& e) override {
+        e.stopPropagating();
+		if (!module) {
+			return;
+        }
+
+		if (e.action == GLFW_PRESS && (e.button == GLFW_MOUSE_BUTTON_LEFT || e.button == GLFW_MOUSE_BUTTON_RIGHT)) {
+            module->waveChannel.toggleDifferentialModeL();
+			e.consume(this);
+		}
+	}
+};
+
+struct WaterTableDifferentialModeRToggle : VektronixToggleDark {
+    WaterTable* module;
+    WaterTableDifferentialModeRToggle() {
+        this->momentary = true;
+    }
+
+    void onButton(const event::Button& e) override {
+        e.stopPropagating();
+		if (!module) {
+			return;
+        }
+
+		if (e.action == GLFW_PRESS && (e.button == GLFW_MOUSE_BUTTON_LEFT || e.button == GLFW_MOUSE_BUTTON_RIGHT)) {
+            module->waveChannel.toggleDifferentialModeR();
+			e.consume(this);
+		}
+	}
+};
+
+
+struct WaterTableDisplay : TransparentWidget {
+	WaterTable* module;
+	const float r = 0.8;
+	Rect b;
+	std::shared_ptr<Font> font;
+	const NVGcolor orange_red_bright = nvgRGBA(0xf5, 0x39, 0x0a, 0xff);
+	const NVGcolor orange_red = nvgRGBA(0xd0, 0x28, 0x0a, 0xff);
+	const NVGcolor ember_orange = nvgRGBA(0xe8, 0xde, 0x1e, 0xff);
+	const NVGcolor hot_white = nvgRGBA(0xff, 0xff, 0xeb, 0xff);
+	const NVGcolor dark_grey = nvgRGBA(0x10, 0x10, 0x10, 0xff);
+	const int HISTORY_SIZE = 16;
+	std::deque<std::vector<float_4>> history;
+
+
+	NVGcolor gradient(float x) {
+		return nvgLerpRGBA(
+			nvgLerpRGBA(orange_red, ember_orange, x),
+			nvgLerpRGBA(ember_orange, hot_white, x),
+			x);
+	}
+
+	WaterTableDisplay() : history(HISTORY_SIZE,
+    		std::vector<float_4>(CHANNEL_SIZE, float_4::zero())) {
+		font = APP->window->loadFont(asset::plugin(pluginInstance, "res/fixedsys-excelsior-301.ttf"));
+	}
+
+	void setBBox() {
+		b = Rect(Vec(0, 0), box.size);
+	}
+
+	#define Y_OFFSET 20.0
+	Vec scaleToBoxByX(Vec v) {
+		Vec p;
+		p.x = rescale(v.x, -1.f, 1.f, b.pos.x, b.pos.x + b.size.x);
+		p.y = rescale(v.y, -1.f, 1.f, Y_OFFSET+b.pos.y, Y_OFFSET+b.pos.y + b.size.x); // circle y scaled to x size
+		return p;
+	}
+
+	Vec circle(float i, float rad) {
+		const float divs = 2.0 * M_PI / CHANNEL_SIZE_FLOATS;
+		return Vec(rad * cos(divs * i - M_PI/2.),
+				   rad * sin(divs * i - M_PI/2.));
+	}
+
+	Vec circle(float i) {
+		return circle(i, r);
+	}
+
+	Vec getMarkerStartFromPos(float pos) {	
+		Vec v = circle(pos);
+		return scaleToBoxByX(v);
+	}
+
+	Vec getMarkerStartFromPos(float pos, float r) {	
+		Vec v = circle(pos, r);
+		return scaleToBoxByX(v);
+	}
+
+	Vec getScaledCircleNormal(float pos) {	
+		Vec v = circle(pos);
+		v = Vec(v.y,-v.x);
+		return scaleToBoxByX(v);
+	}
+
+	float scaledBufferFromIndex(std::vector<float_4> &buffer, int i) {
+		int f_in = i % 4;
+		int f4_in = i / 4;
+		return -rescale(buffer[f4_in][f_in],-10.0f,10.0f,-1.0,1.0);
+	}
+
+
+	void drawWaveform(const DrawArgs& args, std::vector<float_4> &buffer, int index) {
+		float step = static_cast<float>(index) / static_cast<float>(HISTORY_SIZE-1);
+
+		nvgBeginPath(args.vg);
+
+
+		#ifdef DRAW_DEBUG
+		for (int i = 0; i < CHANNEL_SIZE_FLOATS; i+=2) {
+			Vec v0 = circle(i);
+			float s0 =  scaledBufferFromIndex(buffer, i);
+			//v0.y += s0;
+			v0 = v0.plus(v0.mult(s0));
+			Vec p0 = scaleToBoxByX(v0);
+			if (i == 0) {
+				nvgMoveTo(args.vg, p0.x, p0.y);
+			} else {
+				nvgLineTo(args.vg, p0.x, p0.y);
+			}
+		}
+		#else
+		for (int i = 0; i < CHANNEL_SIZE_FLOATS; i+=2) {
+			Vec v0 = circle(i);
+			Vec v1 = circle(i+1.0);
+			float s0 =  scaledBufferFromIndex(buffer, i);
+			float s1 =  scaledBufferFromIndex(buffer, i+1);
+			v0 = v0.plus(v0.mult(s0));
+			v1 = v1.plus(v1.mult(s1));
+
+			Vec p0 = scaleToBoxByX(v0);
+			Vec p1 = scaleToBoxByX(v1);
+
+			if (i == 0) {
+				nvgMoveTo(args.vg, p0.x, p0.y);
+				nvgQuadTo(args.vg, p0.x, p0.y, p1.x, p1.y);
+			} else {
+				nvgQuadTo(args.vg, p0.x, p0.y, p1.x, p1.y);
+			}
+		}
+		#endif
+		nvgClosePath(args.vg);
+		nvgPathWinding(args.vg, NVG_SOLID);
+
+		for (int i = 0; i < CHANNEL_SIZE_FLOATS; i+=2) {
+			Vec v0 = circle(i);
+			Vec v1 = circle(i+1);
+			Vec p0, p1;
+			p0 = scaleToBoxByX(v0);
+			p1 = scaleToBoxByX(v1);
+			if (i == 0) {
+				nvgMoveTo(args.vg, p0.x, p0.y);
+				nvgQuadTo(args.vg, p0.x, p0.y, p1.x, p1.y);
+			} else {
+				nvgQuadTo(args.vg, p0.x, p0.y, p1.x, p1.y);
+			}
+		}
+
+		nvgClosePath(args.vg);
+		nvgPathWinding(args.vg, NVG_HOLE);
+
+		const float alpha_scale = 1.0;
+		float alpha = alpha_scale*simd::pow(step, 2.0);
+		//nvgFillColor(args.vg, nvgTransRGBAf(gradient(0.5*simd::pow(alpha/alpha_scale,3.0)), alpha));
+		nvgFillColor(args.vg, nvgTransRGBAf(gradient(0.0), alpha));
+		nvgFill(args.vg);
+		//nvgLineCap(args.vg, NVG_ROUND);
+		//nvgMiterLimit(args.vg, 2.f);
+		//nvgStrokeWidth(args.vg, 1.0f);
+
+		//nvgStroke(args.vg);
+		//nvgResetScissor(args.vg);
+		
+	}
+
+	/*
+	void drawMarker(const DrawArgs& args, float pos, const char* text, bool left, bool up) {
+		const float markerHeight = 20.0;
+		const float textOffset = 3.0;
+		// Draw line
+		nvgStrokeColor(args.vg, orange_red);
+		nvgLineCap(args.vg, NVG_SQUARE);
+		//nvgMiterLimit(args.vg, 2.f);
+		nvgStrokeWidth(args.vg, 1.0f);
+		nvgFontSize(args.vg, 11);
+		nvgFontFaceId(args.vg, font->handle);
+		nvgFillColor(args.vg, orange_red_bright);
+		{
+			Vec p = getMarkerStartFromPos(pos);
+			nvgBeginPath(args.vg);
+			nvgMoveTo(args.vg, p.x, p.y);
+			float x_off;
+			if (left) {
+				x_off = -markerHeight/2.0;
+			} else {
+				x_off = markerHeight/2.0;
+			}
+			float text_x = -markerHeight/2.0;
+			float y_off;
+			if (up) {
+				y_off = markerHeight;
+			} else {
+				y_off = -markerHeight;
+			}
+			nvgLineTo(args.vg, p.x, p.y+y_off);
+
+			nvgLineTo(args.vg, p.x+x_off, p.y+y_off);
+			//nvgClosePath(args.vg);
+			nvgText(args.vg, p.x+text_x, p.y+y_off + (up ? 2.0*textOffset : -textOffset), text, NULL);
+		}
+		nvgStroke(args.vg);
+	}*/
+
+	Vec pointToSegment(Vec v, Vec p, Vec q)
+	{
+		float pqx, pqy, dx, dy, d, t;
+		pqx = q.x-p.x;
+		pqy = q.y-p.y;
+		dx = v.x-p.x;
+		dy = v.y-p.y;
+		d = pqx*pqx + pqy*pqy;
+		t = pqx*dx + pqy*dy;
+		if (d > 0) t /= d;
+		if (t < 0) t = 0;
+		else if (t > 1) t = 1;
+		return Vec(p.x + t*pqx - v.x, dy = p.y + t*pqy - v.y);
+	}
+
+	Vec minBoxDistance(Vec pos, Vec top_l, Vec top_r, Vec bot_l, Vec bot_r) {
+		Vec top = pointToSegment(pos, top_l, top_r);
+		Vec left = pointToSegment(pos, top_l, bot_l);
+		Vec right = pointToSegment(pos, top_r, bot_r);
+		Vec bot = pointToSegment(pos, bot_l, bot_r);
+
+		Vec min;
+		min = (top.norm() < bot.norm()) ? top : bot;
+		min = (min.norm() < left.norm()) ? min : left;
+		min = (min.norm() < right.norm()) ? min : right;
+		return min;
+	}
+
+	void drawTextBox(const DrawArgs& args, Vec pos_line, Vec center, const char* text) {
+
+		const float width = 30.0;
+		const float height = 10.0;
+		Vec half = Vec(width/2., height/2.);
+		Vec top_l = center.plus(Vec(-half.x, half.y));
+		Vec top_r = center.plus(Vec( half.x, half.y));
+		Vec bot_l = center.plus(Vec(-half.x,-half.y));
+		Vec bot_r = center.plus(Vec( half.x,-half.y));
+
+		Vec circToBox = minBoxDistance(pos_line, top_l, top_r, bot_l, bot_r);
+
+		Vec text_pad = Vec(2,8);
+
+		// There's no documentation anywhere on how compositing works
+		// in NanoVG, and I'm pretty sure it doesn't work according to the specs
+		// it references anyway, so just splatter this everywhere until it works properly
+		nvgGlobalCompositeOperation(args.vg, NVG_LIGHTER);
+		nvgFillColor(args.vg, orange_red_bright);
+		nvgStrokeColor(args.vg, orange_red_bright);
+		
+		nvgGlobalCompositeOperation(args.vg, NVG_LIGHTER);
+		nvgBeginPath(args.vg);
+		nvgGlobalCompositeOperation(args.vg, NVG_LIGHTER);
+		nvgMoveTo(args.vg, top_l.x, top_l.y);
+		nvgLineTo(args.vg, top_r.x, top_r.y);
+		nvgLineTo(args.vg, bot_r.x, bot_r.y);
+		nvgLineTo(args.vg, bot_l.x, bot_l.y);
+		nvgLineTo(args.vg, top_l.x, top_l.y);
+		nvgGlobalCompositeOperation(args.vg, NVG_LIGHTER);
+		nvgClosePath(args.vg);
+		nvgGlobalCompositeOperation(args.vg, NVG_LIGHTER);
+		nvgStroke(args.vg);
+		nvgFill(args.vg);
+
+		nvgStrokeColor(args.vg, orange_red_bright);
+		nvgGlobalCompositeOperation(args.vg, NVG_LIGHTER);
+		nvgBeginPath(args.vg);
+		nvgGlobalCompositeOperation(args.vg, NVG_LIGHTER);
+		nvgMoveTo(args.vg, pos_line.x, pos_line.y);
+		nvgLineTo(args.vg, pos_line.x + circToBox.x, pos_line.y + circToBox.y);
+		nvgGlobalCompositeOperation(args.vg, NVG_LIGHTER);
+		nvgStroke(args.vg);
+		nvgGlobalCompositeOperation(args.vg, NVG_LIGHTER);
+		
+		nvgGlobalCompositeOperation(args.vg, NVG_XOR);
+		nvgFillColor(args.vg, dark_grey);
+		nvgGlobalCompositeOperation(args.vg, NVG_XOR);
+		nvgText(args.vg, bot_l.x+text_pad.x, bot_l.y+text_pad.y, text, NULL);
+		nvgGlobalCompositeOperation(args.vg, NVG_XOR);
+		nvgFill(args.vg);
+		nvgGlobalCompositeOperation(args.vg, NVG_XOR);
+		
+
+		nvgGlobalCompositeOperation(args.vg, NVG_LIGHTER);
+
+		
+
+	}
+
+	void drawMarker(const DrawArgs& args, float pos, const char* text, bool left, bool up) {
+		const float markerHeight = 20.0;
+		const float textOffset = 3.0;
+		// Draw line
+		nvgStrokeColor(args.vg, orange_red);
+		nvgLineCap(args.vg, NVG_SQUARE);
+		//nvgMiterLimit(args.vg, 2.f);
+		nvgStrokeWidth(args.vg, 1.0f);
+		nvgFontSize(args.vg, 11);
+		nvgFontFaceId(args.vg, font->handle);
+		nvgFillColor(args.vg, orange_red_bright);
+		nvgGlobalCompositeOperation(args.vg, NVG_LIGHTER);
+		{
+			Vec p = getMarkerStartFromPos(pos);
+			Vec n = getMarkerStartFromPos(pos, r*0.6);
+			drawTextBox(args, p, n, text);
+		}
+		nvgStroke(args.vg);
+	}
+
+	void drawModelName(const DrawArgs& args) {
+		Vec p = b.pos.plus(Vec(10,10));
+
+		nvgFontSize(args.vg, 11);
+		nvgFontFaceId(args.vg, font->handle);
+		nvgFillColor(args.vg, orange_red_bright);
+		const char* text;
+		switch(module->waveChannel.model) {
+			case WaveChannel::Model::WAVE_EQUATION:
+				text = "WAVE_EQUATION";
+				break;
+			case WaveChannel::Model::SCHRODINGER:
+				text = "SCHRODINGER";
+				break;
+			case WaveChannel::Model::RK4_ADVECTION:
+				text = "RUNGE_KUTTA_RK4";
+				break;
+			case WaveChannel::Model::SQUID_AXON:
+				text = "SQUID_AXON";
+				break;
+			default:
+				text = "";
+				break;
+		}
+		nvgText(args.vg, p.x, p.y, text, NULL);
+
+	}
+
+	void drawMarkers(const DrawArgs& args) {
+		float pos_in_L = module->pos_in_L_param.getValue();
+		float pos_in_R = module->pos_in_R_param.getValue();
+		float pos_out_L = module->pos_out_L_param.getValue();
+		float pos_out_R = module->pos_out_R_param.getValue();
+
+		//nvgScissor(args.vg, b.pos.x, b.pos.y, b.size.x, b.size.y);
+
+		const char* L_IN = "L_IN";
+		const char* R_IN = "R_IN";
+		const char* L_OUT = "L_OUT";
+		const char* R_OUT = "R_OUT";
+		drawMarker(args, pos_in_L, L_IN, true, true);
+		drawMarker(args, pos_in_R, R_IN, false, true);
+		drawMarker(args, pos_out_L, L_OUT, true, false);
+		drawMarker(args, pos_out_R, R_OUT, false, false);
+
+		//nvgResetScissor(args.vg);
+	}
+
+	void draw(const DrawArgs& args) override {
+		if (!module)
+			return;
+
+		history.push_back(module->waveChannel.v_a0);
+		history.pop_front();
+
+		nvgBeginPath(args.vg);
+		nvgRoundedRect(args.vg, b.pos.x, b.pos.y, b.size.x, b.size.y, 10.0);
+		nvgFillColor(args.vg, dark_grey);
+		nvgFill(args.vg);
+		nvgClosePath(args.vg);
+
+		nvgSave(args.vg);
+			nvgGlobalCompositeOperation(args.vg, NVG_LIGHTER);
+			drawModelName(args);
+		nvgRestore(args.vg);
+
+		int i = 0;
+		nvgSave(args.vg);
+			nvgGlobalCompositeOperation(args.vg, NVG_LIGHTER);
+			//nvgGlobalCompositeBlendFuncSeparate(args.vg, NVG_SRC_COLOR, NVG_DST_COLOR, NVG_SRC_COLOR, NVG_DST_COLOR);
+			for (auto v : history) {
+				drawWaveform(args, v, i);
+				i++;
+			}
+		nvgRestore(args.vg);
+
+		nvgSave(args.vg);
+			drawMarkers(args);
+		nvgRestore(args.vg);
+
+	}
+};
+
+
+struct WaterTableWidget : ModuleWidget {
+	WaterTableWidget(WaterTable* module) {
+		setModule(module);
+		setPanel(APP->window->loadSvg(asset::plugin(pluginInstance, "res/WaterTable.svg")));
+
+		{
+			WaterTableModeButton* modelButton = createParamCentered<WaterTableModeButton>(mm2px(Vec(74.5, 78.5)), module, WaterTable::MODEL_BUTTON_PARAM);
+			modelButton->module = module;
+			addParam(modelButton);
+		}
+
+		{
+			WaterTableAdditiveModeLToggle* modelButton = createParamCentered<WaterTableAdditiveModeLToggle>(mm2px(Vec(23.917, 71.29)), module, WaterTable::MULTIPLICATIVE_BUTTON_L_PARAM);
+			modelButton->module = module;
+			addParam(modelButton);
+		}
+
+		{
+			WaterTableAdditiveModeRToggle* modelButton = createParamCentered<WaterTableAdditiveModeRToggle>(mm2px(Vec(57.064, 71.29)), module, WaterTable::MULTIPLICATIVE_BUTTON_R_PARAM);
+			modelButton->module = module;
+			addParam(modelButton);
+		}
+
+		{
+			WaterTableDifferentialModeLToggle* modelButton = createParamCentered<WaterTableDifferentialModeLToggle>(mm2px(Vec(6.442, 71.29)), module, WaterTable::DIFFERENTIAL_BUTTON_L_PARAM);
+			modelButton->module = module;
+			addParam(modelButton);
+		}
+
+		{
+			WaterTableDifferentialModeRToggle* modelButton = createParamCentered<WaterTableDifferentialModeRToggle>(mm2px(Vec(39.589, 71.29)), module, WaterTable::DIFFERENTIAL_BUTTON_R_PARAM);
+			modelButton->module = module;
+			addParam(modelButton);
+		}
+
+		//addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(6.442, 71.29)), module,  WaterTable::DIFFERENTIAL_BUTTON_L_PARAM));
+		//addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(23.917, 71.29)), module, WaterTable::MULTIPLICATIVE_BUTTON_L_PARAM));
+		//addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(39.589, 71.29)), module, WaterTable::DIFFERENTIAL_BUTTON_R_PARAM));
+		//addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(57.064, 71.29)), module, WaterTable::MULTIPLICATIVE_BUTTON_R_PARAM));
+
+
+		addParam(createParamCentered<VektronixInfiniteBigKnob>(mm2px(Vec(48.056, 101.879)), module,  WaterTable::POSITION_OUT_R_PARAM));
+		addParam(createParamCentered<VektronixInfiniteBigKnob>(mm2px(Vec(15.162, 101.948)), module,  WaterTable::POSITION_OUT_L_PARAM));
+		addParam(createParamCentered<VektronixInfiniteBigKnob>(mm2px(Vec(15.197, 25.839)), module, WaterTable::POSITION_IN_L_PARAM));
+		addParam(createParamCentered<VektronixInfiniteBigKnob>(mm2px(Vec(48.183, 25.839)), module, WaterTable::POSITION_IN_R_PARAM));
+
+		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(15.197, 41.881)), module, WaterTable::PROBE_SIGMA_IN_L_PARAM));
+		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(48.183, 41.881)), module, WaterTable::PROBE_SIGMA_IN_R_PARAM));
+		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(15.244, 53.504)), module, WaterTable::INPUT_GAIN_L_PARAM));
+		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(48.248, 53.597)), module, WaterTable::INPUT_GAIN_R_PARAM));
+		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(99.469, 88.337)), module,   WaterTable::DRY_PARAM));
+		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(110.112, 88.337)), module,  WaterTable::WET_PARAM));
+		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(69.13, 117.289)), module,   WaterTable::DAMPING_PARAM));
+		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(79.772, 117.325)), module,  WaterTable::TIMESTEP_PARAM));
+		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(90.414, 117.325)), module,  WaterTable::DECAY_PARAM));
+		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(101.057, 117.325)), module, WaterTable::FEEDBACK_PARAM));
+		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(111.699, 117.325)), module, WaterTable::LOW_CUT_PARAM));
+		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(48.056, 117.922)), module,  WaterTable::PROBE_SIGMA_OUT_R_PARAM));
+		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(15.162, 117.991)), module,  WaterTable::PROBE_SIGMA_OUT_L_PARAM));
+
+		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(6.442, 34.594)), module,  WaterTable::POSITION_IN_L_CV_PARAM));
+		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(39.428, 34.594)), module, WaterTable::POSITION_IN_R_CV_PARAM));
+		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(6.442, 45.726)), module,  WaterTable::PROBE_SIGMA_IN_L_CV_PARAM));
+		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(39.428, 45.726)), module, WaterTable::PROBE_SIGMA_IN_R_CV_PARAM));
+		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(6.442, 59.945)), module,  WaterTable::INPUT_GAIN_L_CV_PARAM));
+		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(39.446, 60.039)), module, WaterTable::INPUT_GAIN_R_CV_PARAM));
+		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(99.469, 71.989)), module,  WaterTable::DRY_CV_PARAM));
+		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(110.112, 71.989)), module, WaterTable::WET_CV_PARAM));
+		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(68.919, 100.941)), module,  WaterTable::DAMPING_CV_PARAM));
+		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(79.75,  100.977)), module,   WaterTable::TIMESTEP_CV_PARAM));
+		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(90.414, 100.977)), module,  WaterTable::DECAY_CV_PARAM));
+		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(101.057, 100.977)), module, WaterTable::FEEDBACK_CV_PARAM));
+		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(111.699, 100.977)), module, WaterTable::LOW_CUT_CV_PARAM));
+		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(39.3, 110.635)), module,    WaterTable::POSITION_OUT_R_CV_PARAM));
+		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(6.406, 110.703)), module,   WaterTable::POSITION_OUT_L_CV_PARAM));
+		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(39.3, 121.766)), module,    WaterTable::PROBE_SIGMA_OUT_R_CV_PARAM));
+		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(6.406, 121.835)), module,   WaterTable::PROBE_SIGMA_OUT_L_CV_PARAM));
+		
+
+
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(15.197, 8.433)), module, WaterTable::PROBE_IN_L_INPUT));
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(48.183, 8.433)), module, WaterTable::PROBE_IN_R_INPUT));
+
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(23.953, 34.594)), module, WaterTable::PROBE_POSITION_IN_L_INPUT));
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(56.939, 34.594)), module, WaterTable::PROBE_POSITION_IN_R_INPUT));
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(23.953, 45.726)), module, WaterTable::PROBE_SIGMA_IN_L_INPUT));
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(56.939, 45.726)), module, WaterTable::PROBE_SIGMA_IN_R_INPUT));
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(23.917, 59.945)), module, WaterTable::INPUT_GAIN_L_INPUT));
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(56.921, 60.039)), module, WaterTable::INPUT_GAIN_R_INPUT));
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(99.469,  80.0)), module, WaterTable::DRY_INPUT));
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(110.112, 80.0)), module, WaterTable::WET_INPUT));
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(68.919,  109.0)), module, WaterTable::DAMPING_INPUT));
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(79.75,   109.0)), module, WaterTable::TIMESTEP_INPUT));
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(90.414,  109.0)), module, WaterTable::DECAY_INPUT));
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(101.057, 109.0)), module, WaterTable::FEEDBACK_INPUT));
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(111.699, 109.0)), module, WaterTable::LOW_CUT_INPUT));
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(56.811, 110.635)), module,  WaterTable::PROBE_POSITION_OUT_R_INPUT));
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(23.917, 110.703)), module,  WaterTable::PROBE_POSITION_OUT_L_INPUT));
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(56.811, 121.766)), module,  WaterTable::PROBE_SIGMA_OUT_R_INPUT));
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(23.917, 121.835)), module,  WaterTable::PROBE_SIGMA_OUT_L_INPUT));
+
+		addOutput(createOutputCentered<VektronixPortBorderlessDark>(mm2px(Vec(15.162, 84.976)), module, WaterTable::PROBE_OUT_L_OUTPUT));
+		addOutput(createOutputCentered<VektronixPortBorderlessDark>(mm2px(Vec(48.056, 85.044)), module, WaterTable::PROBE_OUT_R_OUTPUT));
+
+		addChild(createLightCentered<SmallLight<RedLight>>(mm2px(Vec(115.574, 4.806)), module, WaterTable::EOC_LIGHT));
+		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(10.969, 66.884)), module, WaterTable::INTEGRAL_L_LIGHT));
+		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(19.519, 66.884)), module, WaterTable::ADDITIVE_L_LIGHT));
+		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(10.969, 75.573)), module, WaterTable::DIFFERENTIAL_L_LIGHT));
+		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(19.519, 75.573)), module, WaterTable::MULTIPLICATIVE_L_LIGHT));
+		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(43.973, 66.884)), module, WaterTable::INTEGRAL_R_LIGHT));
+		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(52.523, 66.884)), module, WaterTable::ADDITIVE_R_LIGHT));
+		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(43.973, 75.573)), module, WaterTable::DIFFERENTIAL_R_LIGHT));
+		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(52.523, 75.573)), module, WaterTable::MULTIPLICATIVE_R_LIGHT));
+		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(48.248, 68.917)), module, WaterTable::POS_MODE_LIGHT));
+		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(48.248, 73.663)), module, WaterTable::MOD_MODE_LIGHT));
+
+		{
+			WaterTableDisplay* display = new WaterTableDisplay();
+			display->module = module;
+			display->box.pos = mm2px(Vec(64.349, 9.249));
+			display->box.size = mm2px(Vec(52.213, 57.568));
+			display->setBBox();
+			addChild(display);
+		}
+
+
+
+	}
+};
+
+
+Model* modelWaterTable = createModel<WaterTable, WaterTableWidget>("FreeSurface-WaterTable");

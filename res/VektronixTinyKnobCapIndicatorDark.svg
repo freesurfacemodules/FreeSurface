@@ -1,0 +1,80 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- Created with Inkscape (http://www.inkscape.org/) -->
+
+<svg
+   width="7.3927569mm"
+   height="7.4765897mm"
+   viewBox="0 0 7.3927569 7.4765897"
+   version="1.1"
+   id="svg537680"
+   inkscape:version="1.2-dev (ac43753, 2021-08-09)"
+   sodipodi:docname="VektronixTinyKnobCapIndicatorDark.svg"
+   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
+   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg">
+  <sodipodi:namedview
+     id="namedview537682"
+     pagecolor="#505050"
+     bordercolor="#ffffff"
+     borderopacity="1"
+     inkscape:pageshadow="0"
+     inkscape:pageopacity="0"
+     inkscape:pagecheckerboard="1"
+     inkscape:document-units="mm"
+     showgrid="false"
+     fit-margin-top="0"
+     fit-margin-left="0"
+     fit-margin-right="0"
+     fit-margin-bottom="0"
+     inkscape:zoom="22.627417"
+     inkscape:cx="14.584077"
+     inkscape:cy="11.247417"
+     inkscape:window-width="1304"
+     inkscape:window-height="1041"
+     inkscape:window-x="3033"
+     inkscape:window-y="17"
+     inkscape:window-maximized="0"
+     inkscape:current-layer="layer5" />
+  <defs
+     id="defs537677" />
+  <g
+     inkscape:groupmode="layer"
+     id="layer10"
+     inkscape:label="Layer 7"
+     style="display:inline" />
+  <g
+     inkscape:groupmode="layer"
+     id="layer9"
+     inkscape:label="Layer 6"
+     style="display:inline" />
+  <g
+     inkscape:groupmode="layer"
+     id="layer7"
+     inkscape:label="Layer 4"
+     style="display:inline" />
+  <g
+     inkscape:groupmode="layer"
+     id="layer5"
+     inkscape:label="Layer 2"
+     style="display:inline">
+    <g
+       id="g246821"
+       transform="matrix(0.94100233,0,0,0.94100233,0.21808651,0.22013933)"
+       style="display:inline">
+      <path
+         style="color:#000000;fill:#44241d;fill-opacity:1;stroke-width:0.773514;stroke-linecap:round;stroke-linejoin:round;stroke-miterlimit:0.5;-inkscape-stroke:none;paint-order:stroke fill markers"
+         d="m 3.5476965,1.3478051 a 0.0391267,0.0391267 0 0 0 -0.039279,0.039279 v 1.4699775 a 0.0391267,0.0391267 0 0 0 0.039279,0.039278 h 0.2976249 a 0.0391267,0.0391267 0 0 0 0.039295,-0.039278 v -1.469978 a 0.0391267,0.0391267 0 0 0 -0.039295,-0.03928 z m 0.039278,0.078561 H 3.8060369 V 2.8177838 H 3.5869755 Z"
+         id="path591406" />
+      <path
+         style="color:#000000;fill:#fb450b;fill-opacity:1;stroke-width:0.0782456;stroke-linecap:round;stroke-linejoin:round;stroke-miterlimit:0.5;-inkscape-stroke:none;paint-order:stroke fill markers"
+         d="M 3.5476787,1.3868498 H 3.8450816 V 2.8573622 H 3.5476787 Z"
+         id="path591408" />
+    </g>
+  </g>
+  <g
+     inkscape:groupmode="layer"
+     id="layer6"
+     inkscape:label="Layer 3"
+     style="display:inline" />
+</svg>
