@@ -3,6 +3,7 @@
 #include "OpCache.hpp"
 #include "Profiler.hpp"
 #include <math.h>
+#include <cstring>
 
 using simd::float_4;
 using simd::int32_4;
@@ -322,7 +323,10 @@ struct WaveChannel {
 	}
 
 	// The 3/8s Runge Kutta Method
-	#define INTER_CLAMP(x) smoothclamp((x),-30.0,30.0)
+	#define I_CLAMP 30.0
+	#define F_CLAMP 10.0
+	#define INTER_CLAMP(x) smoothclamp((x),-I_CLAMP,I_CLAMP)
+	#define FINAL_CLAMP(x) smoothclamp((x),-F_CLAMP,F_CLAMP)
 	void RK4_iter_3_8s(
 			const std::vector<float_4> &a0, const std::vector<float_4> &b0, 
 			std::vector<float_4> &a1, std::vector<float_4> &b1) {
@@ -375,13 +379,13 @@ struct WaveChannel {
 		for (int i = 0; i < CHANNEL_SIZE; i++) {
 			//final result
 			//clamping isn't a part of RK4, but it's more convenie3t to do it here than elsewhere
-			a1[i] = smoothclamp(a0[i] + timestep * (a_grad_1[i] + 3.0f * a_grad_2[i] + 3.0f * a_grad_3[i] + a_grad_4[i]) / 8.0f, -10.0, 10.0);
-			b1[i] = smoothclamp(b0[i] + timestep * (b_grad_1[i] + 3.0f * b_grad_2[i] + 3.0f * b_grad_3[i] + b_grad_4[i]) / 8.0f, -10.0, 10.0);
+			a1[i] = FINAL_CLAMP(a0[i] + timestep * (a_grad_1[i] + 3.0f * a_grad_2[i] + 3.0f * a_grad_3[i] + a_grad_4[i]) / 8.0f);
+			b1[i] = FINAL_CLAMP(b0[i] + timestep * (b_grad_1[i] + 3.0f * b_grad_2[i] + 3.0f * b_grad_3[i] + b_grad_4[i]) / 8.0f);
 		}
 
 		// clamp to prevent blowups, but with a large range to avoid clipping in general
-		amp_out_L = math::clamp(amp_sum_out_L / 4.0,-100.0f,100.0f);
-		amp_out_R = math::clamp(amp_sum_out_R / 4.0,-100.0f,100.0f);
+		amp_out_L = math::clamp(amp_sum_out_L / (4.0),-100.0f,100.0f);
+		amp_out_R = math::clamp(amp_sum_out_R / (4.0),-100.0f,100.0f);
 
 	}
 
@@ -649,19 +653,19 @@ struct WaveChannel {
 		switch(this->model) {
 			case WAVE_EQUATION:
 				this->model = Model::SQUID_AXON;
-				this->modelPointer = &stepSquidAxon;
+				this->modelPointer = &WaveChannel::stepSquidAxon;
 				break;
 			case SQUID_AXON:
 				this->model = Model::SCHRODINGER;
-				this->modelPointer = &stepSchrodinger;
+				this->modelPointer = &WaveChannel::stepSchrodinger;
 				break;
 			case SCHRODINGER:
 				this->model = Model::RK4_ADVECTION;
-				this->modelPointer = &stepRK4Advection;
+				this->modelPointer = &WaveChannel::stepRK4Advection;
 				break;
 			case RK4_ADVECTION:
 				this->model = Model::WAVE_EQUATION;
-				this->modelPointer = &stepWaveEquation;
+				this->modelPointer = &WaveChannel::stepWaveEquation;
 				break;
 		}
 	}
@@ -1351,7 +1355,7 @@ struct WaterTableDisplay : TransparentWidget {
 	float scaledBufferFromIndex(std::vector<float_4> &buffer, int i) {
 		int f_in = i % 4;
 		int f4_in = i / 4;
-		return -rescale(buffer[f4_in][f_in],-10.0f,10.0f,-1.0,1.0);
+		return -rescale(buffer[f4_in][f_in],-F_CLAMP,F_CLAMP,-1.0,1.0);
 	}
 
 

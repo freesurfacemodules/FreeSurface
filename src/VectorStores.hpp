@@ -3,6 +3,7 @@
 #include <vector>
 #include <memory>
 #include <cassert>
+#include <cstring>
 #include "samplerate.h"
 
 #define unique_resampler_stereo_float std::unique_ptr<StereoFloatResamplerBuffer>
