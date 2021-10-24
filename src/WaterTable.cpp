@@ -1,9 +1,18 @@
-#define _USE_MATH_DEFINES
 #include "plugin.hpp"
 #include "OpCache.hpp"
 #include "Profiler.hpp"
 #include <math.h>
 #include <cstring>
+/** Enabling this resamples inputs and outputs from each
+	RK4 iteration to get the final output.
+	It would be nice to use this here, but it's way too expensive
+	so for now it's hidden behind a define.
+	In the mean time, we use zero-pad upsampling for the input
+	and biquad lowpass on the output. */
+// #define RESAMPLED_IO
+#ifdef RESAMPLED_IO
+	#include "VectorStores.hpp"
+#endif
 
 using simd::float_4;
 using simd::int32_4;
@@ -37,6 +46,23 @@ struct WaveChannel {
 		RK4_ADVECTION
 	};
 	Model model;
+
+	dsp::BiquadFilter biquad_L;
+	dsp::BiquadFilter biquad_R;
+
+	#ifdef RESAMPLED_IO
+	unique_resampler_stereo_float resampler_in = 
+        std::unique_ptr<resampler_stereo_float>(
+            new resampler_stereo_float(8, 2)
+        );
+
+	unique_resampler_stereo_float resampler_out = 
+        std::unique_ptr<resampler_stereo_float>(
+            new resampler_stereo_float(2, 8)
+        );
+	#endif
+
+	        
 
 	/** Member function pointer for the current model.
 	 *  Nasty, but using a switch or inheritance would be nastier 
@@ -88,6 +114,17 @@ struct WaveChannel {
 	WaveChannel() {
 		model = Model::WAVE_EQUATION;
 		modelPointer = &stepWaveEquation;
+		biquad_L.setParameters(dsp::BiquadFilter::Type::LOWPASS, 0.25f, 0.5f, 1.f);
+		biquad_R.setParameters(dsp::BiquadFilter::Type::LOWPASS, 0.25f, 0.5f, 1.f);
+
+		#ifdef RESAMPLED_IO
+		resampler_in->reset();
+        resampler_in->finalize();
+		resampler_in->setResampleRatio(4.0);
+		resampler_out->reset();
+		resampler_out->finalize();
+		resampler_out->setResampleRatio(0.25);
+		#endif
 	}
 
 	// classic GLSL-style hermite smoothstep function
@@ -240,12 +277,16 @@ struct WaveChannel {
 	std::vector<float_4> b_half_4 = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
 	std::vector<float_4> b_grad_4 = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
 
+	inline void processSample(float &sample_L, float &sample_R) {
+		sample_L = biquad_L.process(sample_L);
+		sample_R = biquad_R.process(sample_R);
+	}
+
 	inline void modelIteration(
 			const std::vector<float_4> &a_in, std::vector<float_4> &delta_a,
 			const std::vector<float_4> &b_in, std::vector<float_4> &delta_b,
 			float &input_L, float &input_R, 
-			float &t_amp_out_L, float &t_amp_out_R,
-			float &amp_sum_out_L, float &amp_sum_out_R) {
+			float &t_amp_out_L, float &t_amp_out_R) {
 
 		gradient_and_laplacian(a_in, t_gradient_a, t_laplacian_a);
 		gradient_and_laplacian(b_in, t_gradient_b, t_laplacian_b);
@@ -253,76 +294,43 @@ struct WaveChannel {
 		t_gradient_a, t_gradient_b, delta_a, delta_b, 
 		input_L, input_R, t_amp_out_L, t_amp_out_R);
 
-		amp_sum_out_L += t_amp_out_L;
-		amp_sum_out_R += t_amp_out_R;
-
+		processSample(t_amp_out_L, t_amp_out_R);
 	}
+
+	#ifdef RESAMPLED_IO
+	inline void prepareInput() {
+		resampler_in->pushInput(amp_in_L, amp_out_R);
+		resampler_in->resample();
+	}
+
+	float t_amp_in_prev_L;
+	float t_amp_in_prev_R;
+
+	inline void processInput(float &input_L, float &input_R, const float &feedback_amp_L, const float &feedback_amp_R) {
+		StereoSample out = resampler_in->shiftOutput();
+		float t_amp_in_L = out.x;
+		float t_amp_in_R = out.y;
+		input_L = feedback * feedback_amp_L + t_amp_in_L - low_cut * t_amp_in_prev_L;
+		input_R = feedback * feedback_amp_R + t_amp_in_R - low_cut * t_amp_in_prev_R;
+		t_amp_in_prev_L = out.x;
+		t_amp_in_prev_R = out.y;
+	}
+
+	inline void processOutput(const float &output_L, const float &output_R) {
+		resampler_out->pushInput(output_L, output_R);
+	}
+
+	inline StereoSample getResampledOutput() {
+		resampler_out->resample();
+		return resampler_out->shiftOutput();
+	}
+	#endif
 
 	/** Runge-Kutta (RK4) integration,
-	 *  used to increase stability at large timesteps
+	 *  Using the 3/8s Runge Kutta method.
+	 *  Used to increase stability at large timesteps
 	 *  and also to upsample our input.
 	 */
-	void RK4_iter(
-			const std::vector<float_4> &a0, const std::vector<float_4> &b0, 
-			std::vector<float_4> &a1, std::vector<float_4> &b1) {
-
-		float amp_sum_out_L = 0.0;
-		float amp_sum_out_R = 0.0;
-		float t_amp_out_L;
-		float t_amp_out_R;
-
-		// Round 1
-		float input_L = feedback * amp_out_L + amp_in_L - low_cut * amp_in_prev_L;
-		float input_R = feedback * amp_out_R + amp_in_R - low_cut * amp_in_prev_R;
-
-		modelIteration( a0, a_grad_1, b0, b_grad_1, input_L, input_R,  
-			t_amp_out_L, t_amp_out_R, amp_sum_out_L, amp_sum_out_R);
-
-		for (int i = 0; i < CHANNEL_SIZE; i++) {
-			smoothclamp(a_half_2[i] = a0[i] + 0.5f * timestep * a_grad_1[i], -10.0, 10.0);
-			smoothclamp(b_half_2[i] = b0[i] + 0.5f * timestep * b_grad_1[i], -10.0, 10.0);
-		}
-
-		// Round 2
-		// input is only non-zero on the first round for simple upsampling
-		input_L = 0.0;
-		input_R = 0.0;
-		
-		modelIteration( a_half_2, a_grad_2, b_half_2, b_grad_2, input_L, input_R,  
-			t_amp_out_L, t_amp_out_R, amp_sum_out_L, amp_sum_out_R);
-
-		for (int i = 0; i < CHANNEL_SIZE; i++) {
-			smoothclamp(a_half_3[i] = a0[i] + 0.5f * timestep * a_grad_2[i], -10.0, 10.0);
-			smoothclamp(b_half_3[i] = b0[i] + 0.5f * timestep * b_grad_2[i], -10.0, 10.0);
-		}
-
-		// Round 3
-		modelIteration( a_half_3, a_grad_3, b_half_3, b_grad_3, input_L, input_R,  
-			t_amp_out_L, t_amp_out_R, amp_sum_out_L, amp_sum_out_R);
-
-		for (int i = 0; i < CHANNEL_SIZE; i++) {
-			smoothclamp(a_half_4[i] = a0[i] + 1.0f * timestep * a_grad_3[i], -10.0, 10.0);
-			smoothclamp(b_half_4[i] = b0[i] + 1.0f * timestep * b_grad_3[i], -10.0, 10.0);
-		}
-
-		// Round 4
-		modelIteration( a_half_4, a_grad_4, b_half_4, b_grad_4, input_L, input_R,  
-			t_amp_out_L, t_amp_out_R, amp_sum_out_L, amp_sum_out_R);
-
-		for (int i = 0; i < CHANNEL_SIZE; i++) {
-			//final result
-			//clamping isn't a part of RK4, but it's more convenient to do it here than elsewhere
-			a1[i] = smoothclamp(a0[i] + timestep * (a_grad_1[i] + 2.0f * a_grad_2[i] + 2.0f * a_grad_3[i] + a_grad_4[i]) / 6.0f, -10.0, 10.0);
-			b1[i] = smoothclamp(b0[i] + timestep * (b_grad_1[i] + 2.0f * b_grad_2[i] + 2.0f * b_grad_3[i] + b_grad_4[i]) / 6.0f, -10.0, 10.0);
-		}
-
-		// clamp to prevent blowups, but with a large range to avoid clipping in general
-		amp_out_L = math::clamp(amp_sum_out_L / 4.0,-100.0f,100.0f);
-		amp_out_R = math::clamp(amp_sum_out_R / 4.0,-100.0f,100.0f);
-
-	}
-
-	// The 3/8s Runge Kutta Method
 	#define I_CLAMP 30.0
 	#define F_CLAMP 10.0
 	#define INTER_CLAMP(x) smoothclamp((x),-I_CLAMP,I_CLAMP)
@@ -331,19 +339,29 @@ struct WaveChannel {
 			const std::vector<float_4> &a0, const std::vector<float_4> &b0, 
 			std::vector<float_4> &a1, std::vector<float_4> &b1) {
 
-		float amp_sum_out_L = 0.0;
-		float amp_sum_out_R = 0.0;
 		float t_amp_out_L;
 		float t_amp_out_R;
 
 		const float third = 1.0/3.0;
 
+		#ifdef RESAMPLED_IO
+		prepareInput();
+		#endif
+
 		// Round 1, initial step
 		float input_L = feedback * amp_out_L + amp_in_L - low_cut * amp_in_prev_L;
 		float input_R = feedback * amp_out_R + amp_in_R - low_cut * amp_in_prev_R;
 
-		modelIteration( a0, a_grad_1, b0, b_grad_1, input_L, input_R,  
-			t_amp_out_L, t_amp_out_R, amp_sum_out_L, amp_sum_out_R);
+		//float input_L, input_R;
+		#ifdef RESAMPLED_IO
+		processInput(input_L, input_R, amp_out_L, amp_out_R);
+		#endif
+
+		modelIteration( a0, a_grad_1, b0, b_grad_1, input_L, input_R, t_amp_out_L, t_amp_out_R);
+
+		#ifdef RESAMPLED_IO
+		processOutput(t_amp_out_L, t_amp_out_R);
+		#endif
 
 		for (int i = 0; i < CHANNEL_SIZE; i++) {
 			INTER_CLAMP(a_half_2[i] = a0[i] + third * timestep * a_grad_1[i]);
@@ -354,9 +372,16 @@ struct WaveChannel {
 		// input is only non-zero on the first round for simple upsampling
 		input_L = 0.0;
 		input_R = 0.0;
+
+		#ifdef RESAMPLED_IO
+		processInput(input_L, input_R, t_amp_out_L, t_amp_out_R);
+		#endif
 		
-		modelIteration( a_half_2, a_grad_2, b_half_2, b_grad_2, input_L, input_R,  
-			t_amp_out_L, t_amp_out_R, amp_sum_out_L, amp_sum_out_R);
+		modelIteration( a_half_2, a_grad_2, b_half_2, b_grad_2, input_L, input_R, t_amp_out_L, t_amp_out_R);
+
+		#ifdef RESAMPLED_IO
+		processOutput(t_amp_out_L, t_amp_out_R);
+		#endif
 
 		for (int i = 0; i < CHANNEL_SIZE; i++) {
 			INTER_CLAMP(a_half_3[i] = a0[i] + timestep * (-third * a_grad_1[i] + a_grad_2[i]));
@@ -364,8 +389,15 @@ struct WaveChannel {
 		}
 
 		// Round 3, 2/3 step
-		modelIteration( a_half_3, a_grad_3, b_half_3, b_grad_3, input_L, input_R,  
-			t_amp_out_L, t_amp_out_R, amp_sum_out_L, amp_sum_out_R);
+		#ifdef RESAMPLED_IO
+		processInput(input_L, input_R, t_amp_out_L, t_amp_out_R);
+		#endif
+
+		modelIteration( a_half_3, a_grad_3, b_half_3, b_grad_3, input_L, input_R, t_amp_out_L, t_amp_out_R);
+
+		#ifdef RESAMPLED_IO
+		processOutput(t_amp_out_L, t_amp_out_R);
+		#endif
 
 		for (int i = 0; i < CHANNEL_SIZE; i++) {
 			INTER_CLAMP(a_half_4[i] = a0[i] + timestep * (a_grad_1[i] - a_grad_2[i] + a_grad_3[i]));
@@ -373,20 +405,32 @@ struct WaveChannel {
 		}
 
 		// Round 4, whole step
-		modelIteration( a_half_4, a_grad_4, b_half_4, b_grad_4, input_L, input_R,  
-			t_amp_out_L, t_amp_out_R, amp_sum_out_L, amp_sum_out_R);
+		#ifdef RESAMPLED_IO
+		processInput(input_L, input_R, t_amp_out_L, t_amp_out_R);
+		#endif
+
+		modelIteration( a_half_4, a_grad_4, b_half_4, b_grad_4, input_L, input_R, t_amp_out_L, t_amp_out_R);
+
+		#ifdef RESAMPLED_IO
+		processOutput(t_amp_out_L, t_amp_out_R);
+		#endif
 
 		for (int i = 0; i < CHANNEL_SIZE; i++) {
 			//final result
-			//clamping isn't a part of RK4, but it's more convenie3t to do it here than elsewhere
+			//clamping isn't a part of RK4, but it's more convenient to do it here than elsewhere
 			a1[i] = FINAL_CLAMP(a0[i] + timestep * (a_grad_1[i] + 3.0f * a_grad_2[i] + 3.0f * a_grad_3[i] + a_grad_4[i]) / 8.0f);
 			b1[i] = FINAL_CLAMP(b0[i] + timestep * (b_grad_1[i] + 3.0f * b_grad_2[i] + 3.0f * b_grad_3[i] + b_grad_4[i]) / 8.0f);
 		}
 
 		// clamp to prevent blowups, but with a large range to avoid clipping in general
-		amp_out_L = math::clamp(amp_sum_out_L / (4.0),-100.0f,100.0f);
-		amp_out_R = math::clamp(amp_sum_out_R / (4.0),-100.0f,100.0f);
-
+		#ifndef RESAMPLED_IO
+		amp_out_L = math::clamp(t_amp_out_L,-100.0f,100.0f);
+		amp_out_R = math::clamp(t_amp_out_R,-100.0f,100.0f);
+		#else
+		StereoSample out = getResampledOutput();
+		amp_out_L = math::clamp(out.x, -100.0f, 100.0f);
+		amp_out_R = math::clamp(out.y, -100.0f, 100.0f);
+		#endif
 	}
 
 	float sum(float_4 x) {
