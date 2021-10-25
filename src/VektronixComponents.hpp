@@ -13,7 +13,7 @@ struct VektronixDiskLight : RectangleLight<TBase> {
 	}
 };
 
-struct VektronixToggle : SVGSwitch {
+struct VektronixToggle : SvgSwitch {
 	VektronixToggle() {
 		addFrame(APP->window->loadSvg(asset::plugin(pluginInstance, "res/VektronixButtonUp.svg")));
 		addFrame(APP->window->loadSvg(asset::plugin(pluginInstance, "res/VektronixButtonDown.svg")));
@@ -21,7 +21,7 @@ struct VektronixToggle : SVGSwitch {
 	}
 };
 
-struct VektronixToggleDark : SVGSwitch {
+struct VektronixToggleDark : SvgSwitch {
 	VektronixToggleDark() {
 		addFrame(APP->window->loadSvg(asset::plugin(pluginInstance, "res/VektronixButtonUpDark.svg")));
 		addFrame(APP->window->loadSvg(asset::plugin(pluginInstance, "res/VektronixButtonDownDark.svg")));
@@ -29,7 +29,7 @@ struct VektronixToggleDark : SVGSwitch {
 	}
 };
 
-struct FreeSurfaceLogoToggleDark : SVGSwitch {
+struct FreeSurfaceLogoToggleDark : SvgSwitch {
 	FreeSurfaceLogoToggleDark() {
 		addFrame(APP->window->loadSvg(asset::plugin(pluginInstance, "res/FreeSurfaceLogoButtonUpDark.svg")));
 		addFrame(APP->window->loadSvg(asset::plugin(pluginInstance, "res/FreeSurfaceLogoButtonDownDark.svg")));

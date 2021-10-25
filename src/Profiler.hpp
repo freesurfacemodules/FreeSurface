@@ -30,7 +30,7 @@ struct ProfilerDaemon {
             DEBUG("Marker %d called %d times, average call time %f ns", i, calls[i], avg);
         }
     }
-} daemon;
+} profilerDaemon;
 
 struct Profile
 {
@@ -44,7 +44,7 @@ struct Profile
 
     ~Profile()
     {
-        daemon.profile(marker, timer.get_elapsed_ns());
+        profilerDaemon.profile(marker, timer.get_elapsed_ns());
     }
 
 };

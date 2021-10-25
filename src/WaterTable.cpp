@@ -236,26 +236,47 @@ struct WaveChannel {
 	#define INDEX_MASK static_cast<unsigned int>(CHANNEL_MASK)
 	#define INDEX_MINUS_1 ((index-1) & INDEX_MASK)
 	#define INDEX_PLUS_1 ((index+1) & INDEX_MASK)
-	typedef float v4sf __attribute__ ((vector_size (16)));
-	typedef int v4si __attribute__ ((vector_size (16)));
-	#define V4SF_TO_FLOAT_4(v) float_4(reinterpret_cast<__m128>(v))
-	#define FLOAT_4_TO_V4SF(f) reinterpret_cast<v4sf>(f.v)
-	inline void gradient_and_laplacian(const std::vector<float_4> &x, std::vector<float_4> &grad_out, std::vector<float_4> &lapl_out) {
-		v4si mask_l = {1,2,3,4};
-		v4si mask_r = {3,4,5,6};
-		for (int index = 0; index < CHANNEL_SIZE; index++) {
-			v4sf e = FLOAT_4_TO_V4SF(x[INDEX_PLUS_1]);
-			v4sf w = FLOAT_4_TO_V4SF(x[INDEX_MINUS_1]);
-			v4sf c = FLOAT_4_TO_V4SF(x[index]);
+	#ifdef __APPLE__
+		typedef float v4sf __attribute__((__vector_size__(16)));
+		typedef int v4si __attribute__((__vector_size__(16)));
+		#define V4SF_TO_FLOAT_4(v) float_4(reinterpret_cast<__m128>(v))
+		#define FLOAT_4_TO_V4SF(f) reinterpret_cast<v4sf>(f.v)
+		inline void gradient_and_laplacian(const std::vector<float_4> &x, std::vector<float_4> &grad_out, std::vector<float_4> &lapl_out) {
+			for (int index = 0; index < CHANNEL_SIZE; index++) {
+				v4sf e = FLOAT_4_TO_V4SF(x[INDEX_PLUS_1]);
+				v4sf w = FLOAT_4_TO_V4SF(x[INDEX_MINUS_1]);
+				v4sf c = FLOAT_4_TO_V4SF(x[index]);
 
-			float_4 shuffle_l = V4SF_TO_FLOAT_4(__builtin_shuffle(c, e, mask_l));
-			float_4 shuffle_r = V4SF_TO_FLOAT_4(__builtin_shuffle(w, c, mask_r));
+				float_4 shuffle_l = V4SF_TO_FLOAT_4(__builtin_shufflevector(c, e, 1, 2, 3, 4));
+				float_4 shuffle_r = V4SF_TO_FLOAT_4(__builtin_shufflevector(w, c, 3, 4, 5, 6));
 
-			grad_out[index] = (shuffle_l - shuffle_r) / 2.0;
+				grad_out[index] = (shuffle_l - shuffle_r) / 2.0;
 
-			lapl_out[index] = shuffle_l + shuffle_r - 2.0 * x[index];
+				lapl_out[index] = shuffle_l + shuffle_r - 2.0 * x[index];
+			}
 		}
-	}
+	#else
+		typedef float v4sf __attribute__ ((vector_size (16)));
+		typedef int v4si __attribute__ ((vector_size (16)));
+		#define V4SF_TO_FLOAT_4(v) float_4(reinterpret_cast<__m128>(v))
+		#define FLOAT_4_TO_V4SF(f) reinterpret_cast<v4sf>(f.v)
+		inline void gradient_and_laplacian(const std::vector<float_4> &x, std::vector<float_4> &grad_out, std::vector<float_4> &lapl_out) {
+			v4si mask_l = {1,2,3,4};
+			v4si mask_r = {3,4,5,6};
+			for (int index = 0; index < CHANNEL_SIZE; index++) {
+				v4sf e = FLOAT_4_TO_V4SF(x[INDEX_PLUS_1]);
+				v4sf w = FLOAT_4_TO_V4SF(x[INDEX_MINUS_1]);
+				v4sf c = FLOAT_4_TO_V4SF(x[index]);
+
+				float_4 shuffle_l = V4SF_TO_FLOAT_4(__builtin_shuffle(c, e, mask_l));
+				float_4 shuffle_r = V4SF_TO_FLOAT_4(__builtin_shuffle(w, c, mask_r));
+
+				grad_out[index] = (shuffle_l - shuffle_r) / 2.0;
+
+				lapl_out[index] = shuffle_l + shuffle_r - 2.0 * x[index];
+			}
+		}
+	#endif
 
 	/** Temporaries for RK4 integration. Declaring them in function scope incurs a huge
 	 *  overhead cost. Some of these (the _half_ vectors) could be reused, but it's not much
