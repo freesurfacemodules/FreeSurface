@@ -15,21 +15,15 @@ jobs:
     strategy:
       matrix:
         config:
-        - {
-            name: Linux,
-            os: ubuntu-latest,
+          - name: Linux
+            os: ubuntu-latest
             prepare-os: sudo apt install -y libglu-dev
-          }
-        - {
-            name: MacOS,
-            os: macos-latest,
+          - name: MacOS
+            os: macos-latest
             prepare-os: ""
-          }
-        - {
-            name: Windows,
-            os: windows-latest,
+          - name: Windows
+            os: windows-latest
             prepare-os: export CC=gcc
-          }
     steps:
       - uses: actions/checkout@v2
         with:
@@ -42,6 +36,7 @@ jobs:
       - name: Patch plugin.mk, use 7zip on Windows
         if: runner.os == 'Windows'
         run: |
+          choco install wget --no-progress
           sed -i 's/zip -q -9 -r/7z a -tzip -mx=9/' $HOME/Rack-SDK/plugin.mk
       - name: Modify plugin version
         # only modify plugin version if no tag was created

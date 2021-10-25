@@ -113,7 +113,7 @@ struct WaveChannel {
 
 	WaveChannel() {
 		model = Model::WAVE_EQUATION;
-		modelPointer = &stepWaveEquation;
+		modelPointer = &WaveChannel::stepWaveEquation;
 		biquad_L.setParameters(dsp::BiquadFilter::Type::LOWPASS, 0.25f, 0.5f, 1.f);
 		biquad_R.setParameters(dsp::BiquadFilter::Type::LOWPASS, 0.25f, 0.5f, 1.f);
 
