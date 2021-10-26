@@ -16,10 +16,14 @@ jobs:
       matrix:
         config:
           - name: Linux
+            uses: ""
             os: ubuntu-latest
+            shell: bash
             prepare-os: sudo apt install -y libglu-dev
           - name: MacOS
+            uses: ""
             os: macos-latest
+            shell: bash
             prepare-os: ""
           - name: Windows
             uses: msys2/setup-msys2@v2
@@ -27,6 +31,7 @@ jobs:
             os: windows-latest
             prepare-os: export CC=gcc
     steps:
+      - uses: ${{ matrix.config.uses }}
       - uses: actions/checkout@v2
         with:
           submodules: recursive
@@ -49,6 +54,7 @@ jobs:
           echo "Set plugin version from $pluginversion to $pluginversion-$gitrev"
           cat <<< `jq --arg VERSION "$pluginversion-$gitrev" '.version=$VERSION' plugin.json` > plugin.json
       - name: Build plugin
+        shell: ${{ matrix.config.shell }}
         run: |
           ${{ matrix.config.prepare-os }}
           export RACK_DIR=$HOME/Rack-SDK
