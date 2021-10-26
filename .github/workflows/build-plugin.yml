@@ -18,17 +18,14 @@ jobs:
           - name: Linux
             needs-msys: false
             os: ubuntu-latest
-            shell: bash
             prepare-os: sudo apt install -y libglu-dev
           - name: MacOS
             needs-msys: false
             os: macos-latest
-            shell: bash
             prepare-os: ""
           - name: Windows
             needs-msys: true
             os: windows-latest
-            shell: msys2 {0}
             prepare-os: export CC=gcc
     steps:
       - uses: actions/checkout@v2
@@ -54,8 +51,17 @@ jobs:
           pluginversion=`jq -r '.version' plugin.json`
           echo "Set plugin version from $pluginversion to $pluginversion-$gitrev"
           cat <<< `jq --arg VERSION "$pluginversion-$gitrev" '.version=$VERSION' plugin.json` > plugin.json
-      - name: Build plugin
-        shell: ${{ matrix.config.shell }}
+      - name: Build plugin MSYS
+        if: ${{ matrix.config.needs-msys }}
+        shell: msys2 {0}
+        run: |
+          ${{ matrix.config.prepare-os }}
+          export RACK_DIR=$HOME/Rack-SDK
+          make -j dep
+          make -j dist
+      - name: Build plugin bash
+        if: ${{ !matrix.config.needs-msys }}
+        shell: bash
         run: |
           ${{ matrix.config.prepare-os }}
           export RACK_DIR=$HOME/Rack-SDK
