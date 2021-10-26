@@ -31,10 +31,11 @@ jobs:
             os: windows-latest
             prepare-os: export CC=gcc
     steps:
-      - uses: ${{ matrix.config.uses }}
       - uses: actions/checkout@v2
         with:
-          submodules: recursive
+            submodules: recursive
+      - if: ${{ matrix.config.uses }}
+        uses: ${{ matrix.config.uses }}
       - name: Get Rack-SDK
         run: |
           pushd $HOME
