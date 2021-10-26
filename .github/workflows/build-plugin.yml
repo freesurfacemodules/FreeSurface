@@ -73,6 +73,7 @@ jobs:
             wget
             zip
             unzip
+            jq
       - name: Get Rack-SDK
         shell: msys2 {0}
         run: |
