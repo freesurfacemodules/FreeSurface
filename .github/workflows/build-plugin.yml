@@ -33,6 +33,11 @@ jobs:
             submodules: recursive
       - if: ${{ matrix.config.needs-msys }}
         uses: msys2/setup-msys2@v2
+        with:
+          update: true
+          install: >-
+            git
+            base-devel
       - name: Get Rack-SDK
         run: |
           pushd $HOME
