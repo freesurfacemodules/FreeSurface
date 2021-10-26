@@ -16,26 +16,26 @@ jobs:
       matrix:
         config:
           - name: Linux
-            uses: ""
+            needs-msys: false
             os: ubuntu-latest
             shell: bash
             prepare-os: sudo apt install -y libglu-dev
           - name: MacOS
-            uses: ""
+            needs-msys: false
             os: macos-latest
             shell: bash
             prepare-os: ""
           - name: Windows
-            uses: msys2/setup-msys2@v2
-            shell: msys2 {0}
+            needs-msys: true
             os: windows-latest
+            shell: msys2 {0}
             prepare-os: export CC=gcc
     steps:
       - uses: actions/checkout@v2
         with:
             submodules: recursive
-      - if: ${{ matrix.config.uses }}
-        uses: ${{ matrix.config.uses }}
+      - if: ${{ matrix.config.needs-msys }}
+        uses: msys2/setup-msys2@v2
       - name: Get Rack-SDK
         run: |
           pushd $HOME
