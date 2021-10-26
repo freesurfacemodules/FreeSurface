@@ -74,6 +74,7 @@ jobs:
             zip
             unzip
             mingw-w64-x86_64-jq
+            mingw-w64-x86_64-toolchain
       - name: Get Rack-SDK
         shell: msys2 {0}
         run: |
