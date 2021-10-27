@@ -47,6 +47,12 @@ struct WaveChannel {
 	};
 	Model model;
 
+	enum ProbeType {
+		INTEGRAL,
+		DIFFERENTIAL,
+		SINC
+	};
+
 	dsp::BiquadFilter biquad_L;
 	dsp::BiquadFilter biquad_R;
 
@@ -89,8 +95,10 @@ struct WaveChannel {
 	// ping pong buffer setup
 	bool pong = false;
 
-	bool differential_mode_L = true;
-	bool differential_mode_R = true;
+	ProbeType input_probe_type_L = ProbeType::INTEGRAL;
+	ProbeType input_probe_type_R = ProbeType::INTEGRAL;
+	ProbeType output_probe_type_L = ProbeType::INTEGRAL;
+	ProbeType output_probe_type_R = ProbeType::INTEGRAL;
 	bool additive_mode_L = true;
 	bool additive_mode_R = true;
 
@@ -221,6 +229,18 @@ struct WaveChannel {
 		float_4 erf_r = smoothstep_erf_deriv(xsq_r);
 		
 		return 0.5*(erf_r-erf_l);
+	}
+
+	/** A sinc function.
+	 *  Using the integral trick to combat aliasing
+	 *  unfortunately doesn't work here.
+	 */
+	inline float_4 sinc(float_4 center, float_4 x, float_4 sig) {
+		float_4 x_s = wrappedSignedDistance(x, center);
+		float_4 x_s2 = x_s / sig;
+		float_4 snc = simd::sin(x_s2)/x_s2;
+		float_4 almost_zero = simd::abs(x_s2) < 1.0e-6f;
+		return simd::ifelse(almost_zero, 1.0, snc);
 	}
 
 	
@@ -633,21 +653,29 @@ struct WaveChannel {
 	}
 
 	// Generate and normalize probe window buffers
-	void generateProbeWindow(std::vector<float_4> &w, bool isDirty, float pos, float sigma, bool deriv) {
+	void generateProbeWindow(std::vector<float_4> &w, bool isDirty, float pos, float sigma, ProbeType probeType) {
 		if (isDirty || dirty_init) {
 			float_4 w_sum = float_4(0.0);
 			for (int i = 0; i < CHANNEL_SIZE; i++) {
 				float_4 f_i = float_4(4.0*i, 4.0*i+1.0, 4.0*i+2.0, 4.0*i+3.0);
-				if (deriv) {
-					w[i] = approxGaussianDeriv(pos, f_i, sigma);
-					w_sum += simd::abs(w[i]);
-				} else {
-					w[i] = approxGaussian(pos, f_i, sigma);
-					w_sum += w[i];
+
+				//temp for testing sinc function
+				switch(probeType) {
+					case INTEGRAL:
+						w[i] = approxGaussian(pos, f_i, sigma);
+						w_sum += w[i];
+						break;
+					case DIFFERENTIAL:
+						w[i] = approxGaussianDeriv(pos, f_i, sigma);
+						w_sum += simd::abs(w[i]);
+						break;
+					case SINC:
+						w[i] = sinc(pos, f_i, sigma);
+						w_sum = 0.25; // hacky way to skip normalization
 				}
 			}
 			float w_norm = sum(w_sum);
-			if (deriv) {
+			if (probeType == ProbeType::DIFFERENTIAL) {
 				w_norm *= 0.5;
 			}
 			for (int i = 0; i < CHANNEL_SIZE; i++) {
@@ -682,10 +710,10 @@ struct WaveChannel {
 		this->pos_out_R = pos_out_R;
 		this->sig_out_L = sig_out_L;
 		this->sig_out_R = sig_out_R;
-		generateProbeWindow(input_probe_L_window, input_probe_L_dirty, this->pos_in_L, this->sig_in_L, differential_mode_L);
-		generateProbeWindow(input_probe_R_window, input_probe_R_dirty, this->pos_in_R, this->sig_in_R, differential_mode_R);
-		generateProbeWindow(output_probe_L_window, output_probe_L_dirty, this->pos_out_L, this->sig_out_L, false);
-		generateProbeWindow(output_probe_R_window, output_probe_R_dirty, this->pos_out_R, this->sig_out_R, false);
+		generateProbeWindow(input_probe_L_window, input_probe_L_dirty, this->pos_in_L, this->sig_in_L, input_probe_type_L);
+		generateProbeWindow(input_probe_R_window, input_probe_R_dirty, this->pos_in_R, this->sig_in_R, input_probe_type_R);
+		generateProbeWindow(output_probe_L_window, output_probe_L_dirty, this->pos_out_L, this->sig_out_L, output_probe_type_L);
+		generateProbeWindow(output_probe_R_window, output_probe_R_dirty, this->pos_out_R, this->sig_out_R, output_probe_type_R);
 	}
 
 	void toggleAdditiveModeL() {
@@ -696,14 +724,36 @@ struct WaveChannel {
 		additive_mode_R = !additive_mode_R;
 	}
 
-	void toggleDifferentialModeL() {
-		differential_mode_L = !differential_mode_L;
-		generateProbeWindow(input_probe_L_window, true, this->pos_in_L, this->sig_in_L, differential_mode_L);
+	void updateProbeType(ProbeType &typeToChange) {
+		switch(typeToChange) {
+			case INTEGRAL:
+				typeToChange = ProbeType::DIFFERENTIAL; break;
+			case DIFFERENTIAL:
+				typeToChange = ProbeType::SINC; break;
+			case SINC:
+				typeToChange = ProbeType::INTEGRAL; break;
+		}
 	}
 
-	void toggleDifferentialModeR() {
-		differential_mode_R = !differential_mode_R;
-		generateProbeWindow(input_probe_R_window, true, this->pos_in_R, this->sig_in_R, differential_mode_R);
+	//void toggleDifferentialModeL() {
+	void toggleInputProbeTypeL() {
+		updateProbeType(input_probe_type_L);
+		generateProbeWindow(input_probe_L_window, true, this->pos_in_L, this->sig_in_L, input_probe_type_L);
+	}
+
+	void toggleInputProbeTypeR() {
+		updateProbeType(input_probe_type_R);
+		generateProbeWindow(input_probe_R_window, true, this->pos_in_R, this->sig_in_R, input_probe_type_R);
+	}
+
+	void toggleOutputProbeTypeL() {
+		updateProbeType(output_probe_type_L);
+		generateProbeWindow(output_probe_L_window, true, this->pos_out_L, this->sig_out_L, output_probe_type_L);
+	}
+
+	void toggleOutputProbeTypeR() {
+		updateProbeType(output_probe_type_R);
+		generateProbeWindow(output_probe_R_window, true, this->pos_out_R, this->sig_out_R, output_probe_type_R);
 	}
 
 
@@ -1021,25 +1071,70 @@ struct WaterTable : Module {
 						break;
 				}
 
-				float diff_light_l = waveChannel.differential_mode_L ? 1.0 : 0.0;
-				float int_light_l = waveChannel.differential_mode_L ? 0.0 : 1.0;
-				float add_light_l = waveChannel.additive_mode_L ? 1.0 : 0.0;
-				float mult_light_l = waveChannel.additive_mode_L ? 0.0 : 1.0;
-
-				float add_light_r;
-				float mult_light_r;
+				float diff_light_l;
+				float int_light_l;
+				float sinc_light_l;
 				float diff_light_r;
 				float int_light_r;
+				float sinc_light_r;
+
+				// TODO: make this more DRY
+				switch(waveChannel.input_probe_type_L) {
+					case WaveChannel::ProbeType::DIFFERENTIAL:
+						diff_light_l = 1.0;
+						int_light_l = 0.0;
+						sinc_light_l = 0.0;
+						break;
+					case WaveChannel::ProbeType::INTEGRAL:
+						diff_light_l = 0.0;
+						int_light_l = 1.0;
+						sinc_light_l = 0.0;
+						break;
+					case WaveChannel::ProbeType::SINC:
+						diff_light_l = 1.0;
+						int_light_l = 1.0;
+						sinc_light_l = 1.0;
+						break;
+					default:
+						diff_light_l = 0.0;
+						int_light_l = 0.0;
+						sinc_light_l = 0.0;
+						break;
+				}
+
+				switch(waveChannel.input_probe_type_R) {
+					case WaveChannel::ProbeType::DIFFERENTIAL:
+						diff_light_r = 1.0;
+						int_light_r = 0.0;
+						sinc_light_r = 0.0;
+						break;
+					case WaveChannel::ProbeType::INTEGRAL:
+						diff_light_r = 0.0;
+						int_light_r = 1.0;
+						sinc_light_r = 0.0;
+						break;
+					case WaveChannel::ProbeType::SINC:
+						diff_light_r = 1.0;
+						int_light_r = 1.0;
+						sinc_light_r = 1.0;
+						break;
+					default:
+						diff_light_r = 0.0;
+						int_light_r = 0.0;
+						sinc_light_r = 0.0;
+						break;
+				}
+
+				float add_light_l  = waveChannel.additive_mode_L ? 1.0 : 0.0;
+				float mult_light_l = waveChannel.additive_mode_L ? 0.0 : 1.0;
+				float add_light_r = waveChannel.additive_mode_R ? 1.0 : 0.0;
+				float mult_light_r = waveChannel.additive_mode_R ? 0.0 : 1.0;
 				if (disable_R_diff_add_lights) {
 					add_light_r = 0.0;
 					mult_light_r = 0.0;
 					diff_light_r = 0.0;
 					int_light_r = 0.0;
-				} else {
-					add_light_r = waveChannel.additive_mode_R ? 1.0 : 0.0;
-					mult_light_r = waveChannel.additive_mode_R ? 0.0 : 1.0;
-					diff_light_r = waveChannel.differential_mode_R ? 1.0 : 0.0;
-					int_light_r = waveChannel.differential_mode_R ? 0.0 : 1.0;
+					sinc_light_r = 0.0;
 				}
 
 				lights[POS_MODE_LIGHT].setBrightness(pos_light);
@@ -1080,14 +1175,24 @@ struct WaterTable : Module {
 		json_object_set_new(rootJ, json_label, json_integer(static_cast<int>(val)));
 	}
 
+	void probeFromJson(json_t* rootJ, WaveChannel::ProbeType &val, const char* json_label) {
+		json_t* j_val = json_object_get(rootJ, json_label);
+		if (j_val)
+			val = static_cast<WaveChannel::ProbeType>(json_integer_value(j_val));
+	}
+
+	void probeToJson(json_t* rootJ, WaveChannel::ProbeType &val, const char* json_label) {
+		json_object_set_new(rootJ, json_label, json_integer(static_cast<int>(val)));
+	}
+
 	json_t* dataToJson() override {
 		json_t* rootJ = json_object();
 		pos_in_L_param.dataToJson(rootJ);
 		pos_in_R_param.dataToJson(rootJ);
 		pos_out_L_param.dataToJson(rootJ);
 		pos_out_R_param.dataToJson(rootJ);
-		booleanToJson(rootJ, waveChannel.differential_mode_L, "differential_mode_L");
-		booleanToJson(rootJ, waveChannel.differential_mode_R, "differential_mode_R");
+		probeToJson(rootJ, waveChannel.input_probe_type_L, "input_probe_type_L");
+		probeToJson(rootJ, waveChannel.input_probe_type_R, "input_probe_type_R");
 		booleanToJson(rootJ, waveChannel.additive_mode_L, "additive_mode_L");
 		booleanToJson(rootJ, waveChannel.additive_mode_R, "additive_mode_R");
 		modelToJson(rootJ, waveChannel.model, "model");
@@ -1099,8 +1204,8 @@ struct WaterTable : Module {
 		pos_in_R_param.dataFromJson(rootJ);
 		pos_out_L_param.dataFromJson(rootJ);
 		pos_out_R_param.dataFromJson(rootJ);
-		booleanFromJson(rootJ, waveChannel.differential_mode_L, "differential_mode_L");
-		booleanFromJson(rootJ, waveChannel.differential_mode_R, "differential_mode_R");
+		probeFromJson(rootJ, waveChannel.input_probe_type_L, "input_probe_type_L");
+		probeFromJson(rootJ, waveChannel.input_probe_type_R, "input_probe_type_R");
 		booleanFromJson(rootJ, waveChannel.additive_mode_L, "additive_mode_L");
 		booleanFromJson(rootJ, waveChannel.additive_mode_R, "additive_mode_R");
 		modelFromJson(rootJ, waveChannel.model, "model");

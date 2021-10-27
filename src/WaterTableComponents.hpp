@@ -84,7 +84,7 @@ struct WaterTableDifferentialModeLToggle : VektronixToggleDark {
         }
 
 		if (e.action == GLFW_PRESS && (e.button == GLFW_MOUSE_BUTTON_LEFT || e.button == GLFW_MOUSE_BUTTON_RIGHT)) {
-            module->waveChannel.toggleDifferentialModeL();
+            module->waveChannel.toggleInputProbeTypeL();
 			e.consume(this);
 		}
 	}
@@ -104,7 +104,7 @@ struct WaterTableDifferentialModeRToggle : VektronixToggleDark {
         }
 
 		if (e.action == GLFW_PRESS && (e.button == GLFW_MOUSE_BUTTON_LEFT || e.button == GLFW_MOUSE_BUTTON_RIGHT)) {
-            module->waveChannel.toggleDifferentialModeR();
+            module->waveChannel.toggleInputProbeTypeR();
 			e.consume(this);
 		}
 	}
