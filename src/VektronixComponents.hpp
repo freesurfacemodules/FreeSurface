@@ -208,6 +208,49 @@ struct VektronixInfiniteBigKnob : app::SvgKnob {
 	}
 };
 
+struct VektronixBigKnobDark : app::SvgKnob {
+	float scale = 1.0;
+	VektronixIndicatorDark* indicator;
+	VektronixBigKnobDark() {
+		minAngle = -0.82*M_PI;
+		maxAngle = 0.82*M_PI;
+		speed = 1.0;
+		setSvg(APP->window->loadSvg(asset::plugin(pluginInstance, "res/VektronixBigKnobDark.svg")));
+		// Add cap
+		widget::FramebufferWidget* capFb = new widget::FramebufferWidget;
+		widget::SvgWidget* cap = new widget::SvgWidget;
+		cap->setSvg(APP->window->loadSvg(asset::plugin(pluginInstance, "res/VektronixBigKnobCapDark.svg")));
+		capFb->addChild(cap);
+		addChild(capFb);
+		indicator = new VektronixIndicatorDark;
+		addChild(indicator);
+	}
+
+	void onChange(const event::Change& e) override {
+		// Re-transform the widget::TransformWidget
+		if (paramQuantity) {
+			float angle;
+			if (paramQuantity->isBounded()) {
+				angle = math::rescale(paramQuantity->getScaledValue(), 0.f, 1.f, minAngle, maxAngle);
+			}
+			else {
+				angle = math::rescale(scale * paramQuantity->getValue(), -1.f, 1.f, minAngle, maxAngle);
+			}
+			angle = std::fmod(angle, 2 * M_PI);
+			indicator->rotateFromParent(angle); // draw our little rotating indicator on top of the cap
+			tw->identity();
+			// Rotate SVG
+			math::Vec center = sw->box.getCenter();
+			tw->translate(center);
+			tw->rotate(angle);
+			tw->translate(center.neg());
+			fb->dirty = true;
+		}
+		Knob::onChange(e);
+	}
+
+};
+
 struct VektronixSmallKnobDark : app::SvgKnob {
 	float scale = 1.0;
 	VektronixIndicatorSmallDark* indicator;

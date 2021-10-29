@@ -8,6 +8,12 @@ using namespace rack;
 using simd::float_4;
 using simd::int32_4;
 
+// Just disables quadratic bezier interpolation 
+// so we can see the raw output better
+//#define DRAW_DEBUG
+
+// These button definitions are super repetitive and need to be
+// templated better, with just a function pointer or something
 template <class TModule>
 struct WaterTableModeButton : FreeSurfaceLogoToggleDark {
     TModule* module;
@@ -71,9 +77,9 @@ struct WaterTableAdditiveModeRToggle : VektronixToggleDark {
 };
 
 template <class TModule>
-struct WaterTableDifferentialModeLToggle : VektronixToggleDark {
+struct WaterTableInputProbeTypeLToggle : VektronixToggleDark {
     TModule* module;
-    WaterTableDifferentialModeLToggle() {
+    WaterTableInputProbeTypeLToggle() {
         this->momentary = true;
     }
 
@@ -91,9 +97,9 @@ struct WaterTableDifferentialModeLToggle : VektronixToggleDark {
 };
 
 template <class TModule>
-struct WaterTableDifferentialModeRToggle : VektronixToggleDark {
+struct WaterTableInputProbeTypeRToggle : VektronixToggleDark {
     TModule* module;
-    WaterTableDifferentialModeRToggle() {
+    WaterTableInputProbeTypeRToggle() {
         this->momentary = true;
     }
 
@@ -105,6 +111,46 @@ struct WaterTableDifferentialModeRToggle : VektronixToggleDark {
 
 		if (e.action == GLFW_PRESS && (e.button == GLFW_MOUSE_BUTTON_LEFT || e.button == GLFW_MOUSE_BUTTON_RIGHT)) {
             module->waveChannel.toggleInputProbeTypeR();
+			e.consume(this);
+		}
+	}
+};
+
+template <class TModule>
+struct WaterTableOutputProbeTypeLToggle : VektronixToggleDark {
+    TModule* module;
+    WaterTableOutputProbeTypeLToggle() {
+        this->momentary = true;
+    }
+
+    void onButton(const event::Button& e) override {
+        e.stopPropagating();
+		if (!module) {
+			return;
+        }
+
+		if (e.action == GLFW_PRESS && (e.button == GLFW_MOUSE_BUTTON_LEFT || e.button == GLFW_MOUSE_BUTTON_RIGHT)) {
+            module->waveChannel.toggleOutputProbeTypeL();
+			e.consume(this);
+		}
+	}
+};
+
+template <class TModule>
+struct WaterTableOutputProbeTypeRToggle : VektronixToggleDark {
+    TModule* module;
+    WaterTableOutputProbeTypeRToggle() {
+        this->momentary = true;
+    }
+
+    void onButton(const event::Button& e) override {
+        e.stopPropagating();
+		if (!module) {
+			return;
+        }
+
+		if (e.action == GLFW_PRESS && (e.button == GLFW_MOUSE_BUTTON_LEFT || e.button == GLFW_MOUSE_BUTTON_RIGHT)) {
+            module->waveChannel.toggleOutputProbeTypeR();
 			e.consume(this);
 		}
 	}

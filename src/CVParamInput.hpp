@@ -9,6 +9,7 @@ using namespace rack;
 using simd::float_4;
 using simd::int32_4;
 
+#define DUMMY_CV 999
 
 template <size_t PARAM, size_t INPUT_CV, size_t PARAM_CV>
 struct CVParamInput {
@@ -23,7 +24,7 @@ struct CVParamInput {
 		Default,
 		Modulo,
 		Exponential,
-		Pitch
+		Pitch 
 	} paramType;
 
 	float paramCacheIn;
@@ -33,7 +34,9 @@ struct CVParamInput {
 
 	void config(Module* module, float min, float max, float def, std::string json_label, std::string label = "", std::string unit = "", float displayBase = 0.f, float displayMultiplier = 1.f, float displayOffset = 0.f) {
 		module->configParam(PARAM, min, max, def, label, unit, displayBase, displayMultiplier, displayOffset);
-		module->configParam(PARAM_CV, -1.0, 1.0, 0.0, label + " CV");
+		if (PARAM_CV != DUMMY_CV) {
+			module->configParam(PARAM_CV, -1.0, 1.0, 0.0, label + " CV");
+		}
 		this->json_label = json_label;
 		this->module = module;
 		this->min = min;
@@ -43,7 +46,9 @@ struct CVParamInput {
 
 	void configModulo(Module* module, float max, float def, std::string json_label, std::string label = "", std::string unit = "", float displayBase = 0.f, float displayMultiplier = 1.f, float displayOffset = 0.f) {
 		module->configParam(PARAM, -HUGE_VALF, HUGE_VALF, def, label, unit, displayBase, displayMultiplier, displayOffset);
-		module->configParam(PARAM_CV, -1.0, 1.0, 0.0, label + " CV");
+		if (PARAM_CV != DUMMY_CV) {
+			module->configParam(PARAM_CV, -1.0, 1.0, 0.0, label + " CV");
+		}
 		this->json_label = json_label;
 		this->module = module;
 		this->min = 0.0;
@@ -53,7 +58,9 @@ struct CVParamInput {
 
 	void configExp(Module* module, float min, float max, float def, std::string json_label, std::string label = "", std::string unit = "", float displayBase = 0.f, float displayMultiplier = 1.f, float displayOffset = 0.f) {
 		module->configParam(PARAM, min, max, def, label, unit, displayBase, displayMultiplier, displayOffset);
-		module->configParam(PARAM_CV, -1.0, 1.0, 0.0, label + " CV");
+		if (PARAM_CV != DUMMY_CV) {
+			module->configParam(PARAM_CV, -1.0, 1.0, 0.0, label + " CV");
+		}
 		this->json_label = json_label;
 		this->module = module;
 		this->min = min;
@@ -63,7 +70,9 @@ struct CVParamInput {
 
 	void configPitch(Module* module, float post_scale, float sample_rate_scale, float shift, float param_min, float param_max, float val_max, float def, std::string json_label, std::string label = "", std::string unit = "", float displayBase = 0.f, float displayMultiplier = 1.f, float displayOffset = 0.f) {
 		module->configParam(PARAM, param_min, param_max, def, label, unit, displayBase, displayMultiplier, displayOffset);
-		module->configParam(PARAM_CV, -1.0, 1.0, 0.0, label + " CV");
+		if (PARAM_CV != DUMMY_CV) {
+			module->configParam(PARAM_CV, -1.0, 1.0, 0.0, label + " CV");
+		}
 		this->json_label = json_label;
 		this->module = module;
 		this->min = 0.0;
@@ -111,7 +120,12 @@ struct CVParamInput {
 
 	float getValue() {
 		float input = simd::rescale(module->inputs[INPUT_CV].getVoltage(0), -5.0, 5.0, -1.0, 1.0);
-		float cv = module->params[PARAM_CV].getValue();
+		float cv;
+		if (PARAM_CV == DUMMY_CV) {
+			cv = 1.0;
+		} else {
+			cv = module->params[PARAM_CV].getValue();
+		}
 		float param = module->params[PARAM].getValue();
 		switch(paramType) {
 			case Modulo:
