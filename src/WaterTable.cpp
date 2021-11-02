@@ -3,16 +3,6 @@
 #include "Profiler.hpp"
 #include <math.h>
 #include <cstring>
-/** Enabling this resamples inputs and outputs from each
-	RK4 iteration to get the final output.
-	It would be nice to use this here, but it's way too expensive
-	so for now it's hidden behind a define.
-	In the mean time, we use zero-pad upsampling for the input
-	and biquad lowpass on the output. */
-// #define RESAMPLED_IO
-#ifdef RESAMPLED_IO
-	#include "VectorStores.hpp"
-#endif
 
 using simd::float_4;
 using simd::int32_4;
@@ -49,22 +39,11 @@ struct WaveChannel {
 		SINC
 	};
 
-	dsp::BiquadFilter biquad_L;
-	dsp::BiquadFilter biquad_R;
-
-	#ifdef RESAMPLED_IO
-	unique_resampler_stereo_float resampler_in = 
-        std::unique_ptr<resampler_stereo_float>(
-            new resampler_stereo_float(8, 2)
-        );
-
-	unique_resampler_stereo_float resampler_out = 
-        std::unique_ptr<resampler_stereo_float>(
-            new resampler_stereo_float(2, 8)
-        );
-	#endif
-
-	        
+	dsp::BiquadFilter biquad_output_L;
+	dsp::BiquadFilter biquad_output_R;
+	dsp::BiquadFilter biquad_input_L;
+	dsp::BiquadFilter biquad_input_R;
+        
 
 	/** Member function pointer for the current model.
 	 *  Nasty, but using a switch or inheritance would be nastier 
@@ -81,8 +60,9 @@ struct WaveChannel {
 
 	ModelPointer modelPointer;
 
-	float pos_in_L, pos_in_R, amp_in_L, amp_in_R, amp_in_prev_L, amp_in_prev_R, sig_in_L, sig_in_R, pos_out_L, pos_out_R, sig_out_L, sig_out_R;
+	float pos_in_L, pos_in_R, amp_in_L, amp_in_R, sig_in_L, sig_in_R, pos_out_L, pos_out_R, sig_out_L, sig_out_R;
 	float amp_out_L, amp_out_R = 0.0; 
+	float amp_in_prev_L , amp_in_prev_R = 0.0;
 	float damping = 0.1; 
 	float timestep = 0.01;
 	float decay = 0.005;
@@ -122,17 +102,13 @@ struct WaveChannel {
 	WaveChannel() {
 		model = Model::WAVE_EQUATION;
 		modelPointer = &WaveChannel::stepWaveEquation;
-		biquad_L.setParameters(dsp::BiquadFilter::Type::LOWPASS, 0.25f, 0.5f, 1.f);
-		biquad_R.setParameters(dsp::BiquadFilter::Type::LOWPASS, 0.25f, 0.5f, 1.f);
-
-		#ifdef RESAMPLED_IO
-		resampler_in->reset();
-        resampler_in->finalize();
-		resampler_in->setResampleRatio(4.0);
-		resampler_out->reset();
-		resampler_out->finalize();
-		resampler_out->setResampleRatio(0.25);
-		#endif
+		const float biquad_cutoff = 0.125f;
+		const float biquad_Q = 0.5f;
+		const float biquad_gain = 1.0f;
+		biquad_input_L.setParameters(dsp::BiquadFilter::Type::LOWPASS,  biquad_cutoff, biquad_Q, biquad_gain);
+		biquad_input_R.setParameters(dsp::BiquadFilter::Type::LOWPASS,  biquad_cutoff, biquad_Q, biquad_gain);
+		biquad_output_L.setParameters(dsp::BiquadFilter::Type::LOWPASS, biquad_cutoff, biquad_Q, biquad_gain);
+		biquad_output_R.setParameters(dsp::BiquadFilter::Type::LOWPASS, biquad_cutoff, biquad_Q, biquad_gain);
 	}
 
 	// classic GLSL-style hermite smoothstep function
@@ -318,16 +294,40 @@ struct WaveChannel {
 	std::vector<float_4> b_half_4 = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
 	std::vector<float_4> b_grad_4 = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
 
-	inline void processSample(float &sample_L, float &sample_R) {
-		sample_L = biquad_L.process(sample_L);
-		sample_R = biquad_R.process(sample_R);
+	#define I_CLAMP 30.0
+	#define F_CLAMP 10.0
+	#define INTER_CLAMP(x) smoothclamp((x),-I_CLAMP,I_CLAMP)
+	#define FINAL_CLAMP(x) smoothclamp((x),-F_CLAMP,F_CLAMP)
+
+	float t_amp_in_prev_L = 0.0f;
+	float t_amp_in_prev_R = 0.0f;
+	
+	
+	inline void processInputSample(float &input_L, float &input_R, const float &feedback_amp_L, const float &feedback_amp_R) {
+		float t_amp_in_L = biquad_input_L.process(input_L);
+		float t_amp_in_R = biquad_input_R.process(input_R);
+		input_L = feedback * INTER_CLAMP(0.25*feedback_amp_L) + t_amp_in_L;
+		input_R = feedback * INTER_CLAMP(0.25*feedback_amp_R) + t_amp_in_R;
+	}
+
+	/*
+	inline void processInputSample(float &input_L, float &input_R, const float &feedback_amp_L, const float &feedback_amp_R) {
+		input_L = biquad_input_L.process(feedback * INTER_CLAMP(feedback_amp_L) + input_L);
+		input_R = biquad_input_R.process(feedback * INTER_CLAMP(feedback_amp_R) + input_R);
+	}*/
+
+	inline void processOutputSample(float &sample_L, float &sample_R) {
+		sample_L = biquad_output_L.process(sample_L);
+		sample_R = biquad_output_R.process(sample_R);
 	}
 
 	inline void modelIteration(
 			const std::vector<float_4> &a_in, std::vector<float_4> &delta_a,
 			const std::vector<float_4> &b_in, std::vector<float_4> &delta_b,
-			float &input_L, float &input_R, 
+			float input_L, float input_R, 
 			float &t_amp_out_L, float &t_amp_out_R) {
+
+		processInputSample(input_L, input_R, t_amp_out_L, t_amp_out_R);
 
 		gradient_and_laplacian(a_in, t_gradient_a, t_laplacian_a);
 		gradient_and_laplacian(b_in, t_gradient_b, t_laplacian_b);
@@ -335,74 +335,22 @@ struct WaveChannel {
 		t_gradient_a, t_gradient_b, delta_a, delta_b, v_dc_a, v_dc_b,
 		input_L, input_R, t_amp_out_L, t_amp_out_R);
 
-		processSample(t_amp_out_L, t_amp_out_R);
+		processOutputSample(t_amp_out_L, t_amp_out_R);
 	}
-
-	#ifdef RESAMPLED_IO
-	inline void prepareInput() {
-		resampler_in->pushInput(amp_in_L, amp_out_R);
-		resampler_in->resample();
-	}
-
-	float t_amp_in_prev_L;
-	float t_amp_in_prev_R;
-
-	inline void processInput(float &input_L, float &input_R, const float &feedback_amp_L, const float &feedback_amp_R) {
-		StereoSample out = resampler_in->shiftOutput();
-		float t_amp_in_L = out.x;
-		float t_amp_in_R = out.y;
-		input_L = feedback * feedback_amp_L + t_amp_in_L - low_cut * t_amp_in_prev_L;
-		input_R = feedback * feedback_amp_R + t_amp_in_R - low_cut * t_amp_in_prev_R;
-		t_amp_in_prev_L = out.x;
-		t_amp_in_prev_R = out.y;
-	}
-
-	inline void processOutput(const float &output_L, const float &output_R) {
-		resampler_out->pushInput(output_L, output_R);
-	}
-
-	inline StereoSample getResampledOutput() {
-		resampler_out->resample();
-		return resampler_out->shiftOutput();
-	}
-	#endif
 
 	/** Runge-Kutta (RK4) integration,
 	 *  Using the 3/8s Runge Kutta method.
 	 *  Used to increase stability at large timesteps
 	 *  and also to upsample our input.
 	 */
-	#define I_CLAMP 30.0
-	#define F_CLAMP 10.0
-	#define INTER_CLAMP(x) smoothclamp((x),-I_CLAMP,I_CLAMP)
-	#define FINAL_CLAMP(x) smoothclamp((x),-F_CLAMP,F_CLAMP)
 	void RK4_iter_3_8s(
 			const std::vector<float_4> &a0, const std::vector<float_4> &b0, 
 			std::vector<float_4> &a1, std::vector<float_4> &b1) {
 
-		float t_amp_out_L;
-		float t_amp_out_R;
-
 		const float third = 1.0/3.0;
 
-		#ifdef RESAMPLED_IO
-		prepareInput();
-		#endif
-
 		// Round 1, initial step
-		float input_L = feedback * amp_out_L + amp_in_L - low_cut * amp_in_prev_L;
-		float input_R = feedback * amp_out_R + amp_in_R - low_cut * amp_in_prev_R;
-
-		//float input_L, input_R;
-		#ifdef RESAMPLED_IO
-		processInput(input_L, input_R, amp_out_L, amp_out_R);
-		#endif
-
-		modelIteration( a0, a_grad_1, b0, b_grad_1, input_L, input_R, t_amp_out_L, t_amp_out_R);
-
-		#ifdef RESAMPLED_IO
-		processOutput(t_amp_out_L, t_amp_out_R);
-		#endif
+		modelIteration( a0, a_grad_1, b0, b_grad_1, amp_in_L - low_cut * amp_in_prev_L, amp_in_R - low_cut * amp_in_prev_R, amp_out_L, amp_out_R);
 
 		for (int i = 0; i < CHANNEL_SIZE; i++) {
 			INTER_CLAMP(a_half_2[i] = a0[i] + third * timestep * a_grad_1[i]);
@@ -410,19 +358,8 @@ struct WaveChannel {
 		}
 
 		// Round 2, 1/3 step
-		// input is only non-zero on the first round for simple upsampling
-		input_L = 0.0;
-		input_R = 0.0;
-
-		#ifdef RESAMPLED_IO
-		processInput(input_L, input_R, t_amp_out_L, t_amp_out_R);
-		#endif
-		
-		modelIteration( a_half_2, a_grad_2, b_half_2, b_grad_2, input_L, input_R, t_amp_out_L, t_amp_out_R);
-
-		#ifdef RESAMPLED_IO
-		processOutput(t_amp_out_L, t_amp_out_R);
-		#endif
+		// input is only non-zero on the first round for upsampling		
+		modelIteration( a_half_2, a_grad_2, b_half_2, b_grad_2, 0.f, 0.f, amp_out_L, amp_out_R);
 
 		for (int i = 0; i < CHANNEL_SIZE; i++) {
 			INTER_CLAMP(a_half_3[i] = a0[i] + timestep * (-third * a_grad_1[i] + a_grad_2[i]));
@@ -430,15 +367,7 @@ struct WaveChannel {
 		}
 
 		// Round 3, 2/3 step
-		#ifdef RESAMPLED_IO
-		processInput(input_L, input_R, t_amp_out_L, t_amp_out_R);
-		#endif
-
-		modelIteration( a_half_3, a_grad_3, b_half_3, b_grad_3, input_L, input_R, t_amp_out_L, t_amp_out_R);
-
-		#ifdef RESAMPLED_IO
-		processOutput(t_amp_out_L, t_amp_out_R);
-		#endif
+		modelIteration( a_half_3, a_grad_3, b_half_3, b_grad_3, 0.f, 0.f, amp_out_L, amp_out_R);
 
 		for (int i = 0; i < CHANNEL_SIZE; i++) {
 			INTER_CLAMP(a_half_4[i] = a0[i] + timestep * (a_grad_1[i] - a_grad_2[i] + a_grad_3[i]));
@@ -446,15 +375,7 @@ struct WaveChannel {
 		}
 
 		// Round 4, whole step
-		#ifdef RESAMPLED_IO
-		processInput(input_L, input_R, t_amp_out_L, t_amp_out_R);
-		#endif
-
-		modelIteration( a_half_4, a_grad_4, b_half_4, b_grad_4, input_L, input_R, t_amp_out_L, t_amp_out_R);
-
-		#ifdef RESAMPLED_IO
-		processOutput(t_amp_out_L, t_amp_out_R);
-		#endif
+		modelIteration( a_half_4, a_grad_4, b_half_4, b_grad_4, 0.f, 0.f, amp_out_L, amp_out_R);
 
 		for (int i = 0; i < CHANNEL_SIZE; i++) {
 			//final result
@@ -464,14 +385,8 @@ struct WaveChannel {
 		}
 
 		// clamp to prevent blowups, but with a large range to avoid clipping in general
-		#ifndef RESAMPLED_IO
-		amp_out_L = math::clamp(t_amp_out_L,-100.0f,100.0f);
-		amp_out_R = math::clamp(t_amp_out_R,-100.0f,100.0f);
-		#else
-		StereoSample out = getResampledOutput();
-		amp_out_L = math::clamp(out.x, -100.0f, 100.0f);
-		amp_out_R = math::clamp(out.y, -100.0f, 100.0f);
-		#endif
+		amp_out_L = math::clamp(amp_out_L,-100.0f,100.0f);
+		amp_out_R = math::clamp(amp_out_R,-100.0f,100.0f);
 	}
 
 	float sum(float_4 x) {
@@ -794,18 +709,32 @@ struct WaveChannel {
 		switch(this->model) {
 			case WAVE_EQUATION:
 				this->model = Model::SQUID_AXON;
-				this->modelPointer = &WaveChannel::stepSquidAxon;
 				break;
 			case SQUID_AXON:
 				this->model = Model::SCHRODINGER;
-				this->modelPointer = &WaveChannel::stepSchrodinger;
 				break;
 			case SCHRODINGER:
 				this->model = Model::RK4_ADVECTION;
-				this->modelPointer = &WaveChannel::stepRK4Advection;
 				break;
 			case RK4_ADVECTION:
 				this->model = Model::WAVE_EQUATION;
+				break;
+		}
+		setModelPointer();
+	}
+
+	void setModelPointer() {
+		switch(this->model) {
+			case SQUID_AXON:
+				this->modelPointer = &WaveChannel::stepSquidAxon;
+				break;
+			case SCHRODINGER:
+				this->modelPointer = &WaveChannel::stepSchrodinger;
+				break;
+			case RK4_ADVECTION:
+				this->modelPointer = &WaveChannel::stepRK4Advection;
+				break;
+			case WAVE_EQUATION:
 				this->modelPointer = &WaveChannel::stepWaveEquation;
 				break;
 		}
@@ -843,6 +772,7 @@ struct WaveChannel {
 
 	// Update the ping-pong buffers
 	void update() {
+		setModelPointer();
 		if (pong) {
 			RK4_iter_3_8s(v_a0, v_b0, v_a1, v_b1);
 		} else {
@@ -1071,6 +1001,16 @@ struct WaterTable : Module {
 			additiveLight = additiveMode ? 1.0 : 0.0;
 			multiplicativeLight = additiveMode ? 0.0 : 1.0;
 		}
+	}
+
+	void onReset() override {
+		waveChannel.additive_mode_L = true;
+		waveChannel.additive_mode_R = true;
+		waveChannel.input_probe_type_L = WaveChannel::ProbeType::INTEGRAL;
+		waveChannel.input_probe_type_R = WaveChannel::ProbeType::INTEGRAL;
+		waveChannel.output_probe_type_L = WaveChannel::ProbeType::INTEGRAL;
+		waveChannel.output_probe_type_R = WaveChannel::ProbeType::INTEGRAL;
+		waveChannel.dirty_init = true;
 	}
 
 	void process(const ProcessArgs& args) override {
