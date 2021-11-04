@@ -295,7 +295,7 @@ struct WaveChannel {
 	std::vector<float_4> b_grad_4 = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
 
 	#define I_CLAMP 30.0
-	#define F_CLAMP 10.0
+	#define F_CLAMP 30.0
 	#define INTER_CLAMP(x) smoothclamp((x),-I_CLAMP,I_CLAMP)
 	#define FINAL_CLAMP(x) smoothclamp((x),-F_CLAMP,F_CLAMP)
 
@@ -306,8 +306,19 @@ struct WaveChannel {
 	inline void processInputSample(float &input_L, float &input_R, const float &feedback_amp_L, const float &feedback_amp_R) {
 		float t_amp_in_L = biquad_input_L.process(input_L);
 		float t_amp_in_R = biquad_input_R.process(input_R);
-		input_L = feedback * INTER_CLAMP(0.25*feedback_amp_L) + t_amp_in_L;
-		input_R = feedback * INTER_CLAMP(0.25*feedback_amp_R) + t_amp_in_R;
+		//input_L = feedback * INTER_CLAMP(0.25*feedback_amp_L) + t_amp_in_L;
+		//input_R = feedback * INTER_CLAMP(0.25*feedback_amp_R) + t_amp_in_R;
+
+		// no really special reason for this, but squid axon rapidly squashes
+		// inputs, so it can take more feedback
+		if (model == WaveChannel::SQUID_AXON) {
+			input_L = feedback * feedback_amp_L + t_amp_in_L;
+			input_R = feedback * feedback_amp_R + t_amp_in_R;
+		} else {
+			input_L = feedback * INTER_CLAMP(0.25 * feedback_amp_L) + t_amp_in_L;
+			input_R = feedback * INTER_CLAMP(0.25 * feedback_amp_R) + t_amp_in_R;
+		}
+
 	}
 
 	/*
@@ -393,6 +404,16 @@ struct WaveChannel {
 		return x[0] + x[1] + x[2] + x[3];
 	}
 
+	/* for stability, the coefficient for laplacian components
+		should always work out to be <= 0.5. 
+		(This limit is complicated somewhat when using RK4, 
+		but holds for euler integration and our laplacian stencil. 
+		RK4 raises the limit however, so 0.5 is a safe assumption)
+	*/
+	inline float getSafeTimestep() {
+		return std::min(1.0f, 1.0f/(2.0f*timestep));
+	}
+
 	void stepWaveEquation(
 		const std::vector<float_4> &a0, const std::vector<float_4> &b0, 
 		const std::vector<float_4> &laplacian_a, const std::vector<float_4> &laplacian_b,
@@ -404,6 +425,8 @@ struct WaveChannel {
 		
 		float_4 probe_out_L = float_4(0.0);
 		float_4 probe_out_R = float_4(0.0);
+
+		float safe_timestep = getSafeTimestep();
 
 		for (int i = 0; i < CHANNEL_SIZE; i++) {
 			float_4 probe_in_L = t_input_L * input_probe_L_window[i];
@@ -423,7 +446,7 @@ struct WaveChannel {
 					(additive_mode_L ? probe_in_L : 0.0) + 
 					(additive_mode_R ? probe_in_R : 0.0);*/
 
-			delta_a[i] = (summed_probe_input + b + damping * laplacian_a[i] - decay * a - dc_bias_a[i]);
+			delta_a[i] = (summed_probe_input + b + safe_timestep * damping * laplacian_a[i] - decay * a - dc_bias_a[i]);
 			delta_b[i] = (laplacian_a[i] - decay * b - dc_bias_b[i]);
 
 			/* experimental "equality" mode
@@ -459,26 +482,27 @@ struct WaveChannel {
 		float_4 probe_out_L = float_4(0.0);
 		float_4 probe_out_R = float_4(0.0);
 
+		float safe_timestep = getSafeTimestep();
+
+		// Squid axon params
+		float k1 = 1.0-decay;
+		const float k2 = 0.0;
+		const float k3 = 1.0;
+		const float k4 = 1.0;
+		const float epsilon = 0.1;
+		float delta = safe_timestep * damping;
+		const float ak0 = -0.1;
+		const float ak1 = 2.0;
+
 		for (int i = 0; i < CHANNEL_SIZE; i++) {
 			float_4 probe_in_L = t_input_L * input_probe_L_window[i];
 			float_4 probe_in_R = t_input_R * input_probe_R_window[i];
 
-			float_4 a = simd::clamp(a0[i],-1.0f,1.0f);
-			float_4 b = simd::clamp(b0[i],-1.0f,1.0f);
+			float_4 a = simd::clamp(a0[i],-2.0f,2.0f);
+			float_4 b = simd::clamp(b0[i],-2.0f,2.0f);
 
 			probe_out_L += a * output_probe_L_window[i];
 			probe_out_R += a * output_probe_R_window[i];
-
-			// Squid axon
-			const float k1 = 1.0;
-			const float k2 = 0.0;
-			const float k3 = 1.0;
-			float k4 = 0.995+0.1*decay;
-			const float epsilon = 0.1;
-			//#define delta 0.0
-			float delta = 0.5*damping;
-			const float ak0 = -0.1;
-			const float ak1 = 2.0;
 
 			float_4 summed_probe_input_a = 
 					(additive_mode_L ? probe_in_L : (a * probe_in_L)) + 
@@ -486,7 +510,7 @@ struct WaveChannel {
 			float_4 summed_probe_input_b = 
 					(additive_mode_L ? probe_in_L : (b * probe_in_L)) + 
 					(additive_mode_R ? probe_in_R : (b * probe_in_R));
-			delta_a[i] = summed_probe_input_a + k1*a - k2*a*a - k4*a*a*a - b + (1.0 + delta) * laplacian_a[i];
+			delta_a[i] = summed_probe_input_a + k1*a - k2*a*a - k4*a*a*a - b + safe_timestep * laplacian_a[i];
 			delta_b[i] = - summed_probe_input_b + epsilon*(k3*a - ak1*b - ak0) + delta*laplacian_b[i];
 		}
 
@@ -506,6 +530,8 @@ struct WaveChannel {
 		float_4 probe_out_L = float_4(0.0);
 		float_4 probe_out_R = float_4(0.0);
 
+		float safe_timestep = getSafeTimestep();
+
 		for (int i = 0; i < CHANNEL_SIZE; i++) {
 			float_4 probe_in_L = t_input_L * input_probe_L_window[i];
 			float_4 probe_in_R = t_input_R * input_probe_R_window[i];
@@ -524,8 +550,8 @@ struct WaveChannel {
 					(additive_mode_R ? probe_in_R : (b * probe_in_R));
 			// Schrodinger equation, with added diffusion and decay
 			// "multiplicative mode" should be considered the physically correct default here
-			delta_a[i] =  (-summed_probe_input_a + - laplacian_b[i] - decay * a + damping * laplacian_a[i]);
-			delta_b[i] = ( summed_probe_input_b + laplacian_a[i] - decay * b + damping * laplacian_b[i]);
+			delta_a[i] =  (-summed_probe_input_a + - laplacian_b[i] - decay * a + safe_timestep * damping * laplacian_a[i]);
+			delta_b[i] = ( summed_probe_input_b + laplacian_a[i] - decay * b + safe_timestep * damping * laplacian_b[i]);
 		}
 
 		t_amp_out_L = sum(probe_out_L);
@@ -548,6 +574,8 @@ struct WaveChannel {
 		float pos_to_mod_offset = 2.0*(pos_in_R - (MAX_POSITION / 2.0)) / MAX_POSITION;
 		probe_in_R = sig_in_R * (probe_in_R + pos_to_mod_offset);
 
+		float safe_timestep = getSafeTimestep();
+
 		for (int i = 0; i < CHANNEL_SIZE; i++) {
 			float_4 probe_in_L = t_input_L * input_probe_L_window[i];
 			
@@ -566,7 +594,7 @@ struct WaveChannel {
 			//		(additive_mode_R ? probe_in_R : (a * probe_in_R));
 
 			// gradients are smoothclamped for stability
-			delta_a[i] = smoothclamp((summed_probe_input_a + damping * laplacian_a[i] - decay * a)  // input
+			delta_a[i] = smoothclamp((summed_probe_input_a + safe_timestep * damping * laplacian_a[i] - decay * a)  // input
 					- probe_in_R * gradient_a[i], -10.0f, 10.0f); // advection
 
 		}
@@ -762,6 +790,15 @@ struct WaveChannel {
 		return text;
 	}
 
+	bool isModMode() {
+		switch(model) {
+			case WaveChannel::Model::RK4_ADVECTION:
+				return true;
+			default:
+				return false;
+		}
+	}
+
 	float getAmpOutL() {
 		return amp_out_L;
 	}
@@ -919,10 +956,11 @@ struct WaterTable : Module {
 	#define DECAY_MAX 0.5
 	#define DECAY_DEF 0.002
 
-	#define TIMESTEP_SHIFT 3.191
+	//#define TIMESTEP_SHIFT 3.191
+	#define TIMESTEP_SHIFT 5.191
 	#define TIMESTEP_MAX 0.4
-	#define TIMESTEP_KNOB_MIN -8.0
-	#define TIMESTEP_KNOB_MAX 8.0
+	#define TIMESTEP_KNOB_MIN -5.0
+	#define TIMESTEP_KNOB_MAX 5.0
 	#define TIMESTEP_DEF 0.0
 	#define TIMESTEP_SLEW_RATE 0.02f
 	#define TIMESTEP_POST_SCALE 1.5
@@ -930,6 +968,10 @@ struct WaterTable : Module {
 	#define FEEDBACK_MIN -8.0
 	#define FEEDBACK_MAX 8.0
 	#define FEEDBACK_DEF 0.0
+
+	#define MIN_GAIN 0.0
+	#define MAX_GAIN 8.0
+	#define DEF_GAIN 6.0
 
 	
 	WaterTable() : timestepSlewLimiter(TIMESTEP_SLEW_RATE) {
@@ -948,10 +990,10 @@ struct WaterTable : Module {
 		decay_param.configExp(this, DECAY_MIN, DECAY_MAX, DECAY_DEF, "decay", "Decay");
 		feedback_param.config(this, FEEDBACK_MIN, FEEDBACK_MAX, FEEDBACK_DEF, "feedback", "Feedback");
 		low_cut_param.config(this, LOW_CUT_MIN, LOW_CUT_MAX, LOW_CUT_DEF, "low_cut", "Low Cut");
-		input_gain_L_param.configExp(this, 0.0, 8.0, 6.0, "input_gain_L", "Input Gain L");
-		input_gain_R_param.configExp(this, 0.0, 8.0, 6.0, "input_gain_R", "Input Gain R");
-		dry_param.configExp(this, 0.0, 8.0, 0.0, "dry", "Dry Gain");
-		wet_param.configExp(this, 0.0, 8.0, 6.0, "wet", "Wet Gain");
+		input_gain_L_param.configExp(this, MIN_GAIN , MAX_GAIN, DEF_GAIN, "input_gain_L", "Input Gain L");
+		input_gain_R_param.configExp(this, MIN_GAIN , MAX_GAIN, DEF_GAIN, "input_gain_R", "Input Gain R");
+		dry_param.configExp(this, MIN_GAIN , MAX_GAIN, MIN_GAIN , "dry", "Dry Gain");
+		wet_param.configExp(this, MIN_GAIN , MAX_GAIN, DEF_GAIN, "wet", "Wet Gain");
 		lightDivider.setDivision(16);
 	}
 
@@ -1192,7 +1234,7 @@ struct WaterTableWidget : ModuleWidget {
 		setPanel(APP->window->loadSvg(asset::plugin(pluginInstance, "res/WaterTable.svg")));
 
 		{
-			//addParam(createParamCentered<>(mm2px(Vec(69.566, 83.327)), module, WaterTable::MODEL_BUTTON_PARAM));
+			//addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(69.566, 83.327)), module, WaterTable::MODEL_BUTTON_PARAM));
 			WaterTableModeButton<WaterTable>* modelButton 
 					= createParamCentered<WaterTableModeButton<WaterTable>>(mm2px(Vec(69.566, 83.327)), module, WaterTable::MODEL_BUTTON_PARAM);
 			modelButton->module = module;
@@ -1200,49 +1242,49 @@ struct WaterTableWidget : ModuleWidget {
 		}
 
 		{
-			//addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(18.94, 63.227)), module, WaterTable::MULTIPLICATIVE_BUTTON_L_PARAM));
+			//addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(18.94, 66.2)), module, WaterTable::MULTIPLICATIVE_BUTTON_L_PARAM));
 			WaterTableAdditiveModeLToggle<WaterTable>* modelButton 
-					= createParamCentered<WaterTableAdditiveModeLToggle<WaterTable>>(mm2px(Vec(18.94, 63.227)), module, WaterTable::MULTIPLICATIVE_BUTTON_L_PARAM);
+					= createParamCentered<WaterTableAdditiveModeLToggle<WaterTable>>(mm2px(Vec(18.94, 66.2)), module, WaterTable::MULTIPLICATIVE_BUTTON_L_PARAM);
 			modelButton->module = module;
 			addParam(modelButton);
 		}
 
 		{
-			//addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(48.062, 63.227)), module, WaterTable::MULTIPLICATIVE_BUTTON_R_PARAM));
+			//addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(48.062, 66.2)), module, WaterTable::MULTIPLICATIVE_BUTTON_R_PARAM));
 			WaterTableAdditiveModeRToggle<WaterTable>* modelButton 
-					= createParamCentered<WaterTableAdditiveModeRToggle<WaterTable>>(mm2px(Vec(48.062, 63.227)), module, WaterTable::MULTIPLICATIVE_BUTTON_R_PARAM);
+					= createParamCentered<WaterTableAdditiveModeRToggle<WaterTable>>(mm2px(Vec(48.062, 66.2)), module, WaterTable::MULTIPLICATIVE_BUTTON_R_PARAM);
 			modelButton->module = module;
 			addParam(modelButton);
 		}
 
 		{
-			//addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(5.018, 63.552)), module, WaterTable::INPUT_PROBE_TYPE_BUTTON_L_PARAM));
+			//addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(5.018, 66.198)), module, WaterTable::INPUT_PROBE_TYPE_BUTTON_L_PARAM));
 			WaterTableInputProbeTypeLToggle<WaterTable>* modelButton 
-					= createParamCentered<WaterTableInputProbeTypeLToggle<WaterTable>>(mm2px(Vec(5.018, 63.552)), module, WaterTable::INPUT_PROBE_TYPE_BUTTON_L_PARAM);
+					= createParamCentered<WaterTableInputProbeTypeLToggle<WaterTable>>(mm2px(Vec(5.018, 66.198)), module, WaterTable::INPUT_PROBE_TYPE_BUTTON_L_PARAM);
 			modelButton->module = module;
 			addParam(modelButton);
 		}
 
 		{
-			//addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(34.14, 63.552)), module, WaterTable::INPUT_PROBE_TYPE_BUTTON_R_PARAM));
+			//addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(34.14, 66.198)), module, WaterTable::INPUT_PROBE_TYPE_BUTTON_R_PARAM));
 			WaterTableInputProbeTypeRToggle<WaterTable>* modelButton 
-					= createParamCentered<WaterTableInputProbeTypeRToggle<WaterTable>>(mm2px(Vec(34.14, 63.552)), module, WaterTable::INPUT_PROBE_TYPE_BUTTON_R_PARAM);
+					= createParamCentered<WaterTableInputProbeTypeRToggle<WaterTable>>(mm2px(Vec(34.14, 66.198)), module, WaterTable::INPUT_PROBE_TYPE_BUTTON_R_PARAM);
 			modelButton->module = module;
 			addParam(modelButton);
 		}
 
 		{
-			//addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(4.991, 120.152)), module, WaterTable::OUTPUT_PROBE_TYPE_BUTTON_L_PARAM));
+			//addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(4.991, 121.739)), module, WaterTable::OUTPUT_PROBE_TYPE_BUTTON_L_PARAM));
 			WaterTableOutputProbeTypeLToggle<WaterTable>* modelButton 
-					= createParamCentered<WaterTableOutputProbeTypeLToggle<WaterTable>>(mm2px(Vec(4.991, 120.152)), module, WaterTable::OUTPUT_PROBE_TYPE_BUTTON_L_PARAM);
+					= createParamCentered<WaterTableOutputProbeTypeLToggle<WaterTable>>(mm2px(Vec(4.991, 121.739)), module, WaterTable::OUTPUT_PROBE_TYPE_BUTTON_L_PARAM);
 			modelButton->module = module;
 			addParam(modelButton);
 		}
 
 		{
-			//addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(33.937, 120.152)), module, WaterTable::OUTPUT_PROBE_TYPE_BUTTON_R_PARAM));
+			//addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(34.287, 121.739)), module, WaterTable::OUTPUT_PROBE_TYPE_BUTTON_R_PARAM));
 			WaterTableOutputProbeTypeRToggle<WaterTable>* modelButton 
-					= createParamCentered<WaterTableOutputProbeTypeRToggle<WaterTable>>(mm2px(Vec(33.937, 120.152)), module, WaterTable::OUTPUT_PROBE_TYPE_BUTTON_R_PARAM);
+					= createParamCentered<WaterTableOutputProbeTypeRToggle<WaterTable>>(mm2px(Vec(34.287, 121.739)), module, WaterTable::OUTPUT_PROBE_TYPE_BUTTON_R_PARAM);
 			modelButton->module = module;
 			addParam(modelButton);
 		}
@@ -1258,91 +1300,88 @@ struct WaterTableWidget : ModuleWidget {
 			addChild(display);
 		}
 		
+		
 
+		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(23.75, 19.313)), module, WaterTable::POSITION_IN_L_CV_PARAM));
+		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(53.046, 19.313)), module, WaterTable::POSITION_IN_R_CV_PARAM));
+		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(6.421, 40.993)), module, WaterTable::PROBE_SIGMA_IN_L_CV_PARAM));
+		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(35.717, 40.993)), module, WaterTable::PROBE_SIGMA_IN_R_CV_PARAM));
+		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(6.421, 53.047)), module, WaterTable::INPUT_GAIN_L_CV_PARAM));
+		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(35.676, 53.047)), module, WaterTable::INPUT_GAIN_R_CV_PARAM));
+		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(23.75, 89.313)), module, WaterTable::POSITION_OUT_L_CV_PARAM));
+		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(53.046, 89.313)), module, WaterTable::POSITION_OUT_R_CV_PARAM));
+		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(83.969, 104.575)), module, WaterTable::DAMPING_CV_PARAM));
+		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(94.324, 104.575)), module, WaterTable::DECAY_CV_PARAM));
+		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(104.848, 104.575)), module, WaterTable::FEEDBACK_CV_PARAM));
+		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(115.382, 104.575)), module, WaterTable::LOW_CUT_CV_PARAM));
+		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(6.421, 110.41)), module, WaterTable::PROBE_SIGMA_OUT_L_CV_PARAM));
+		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(35.676, 110.41)), module, WaterTable::PROBE_SIGMA_OUT_R_CV_PARAM));
+		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(95.75, 93.843)), module, WaterTable::DRY_CV_PARAM));
+		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(115.288, 93.843)), module, WaterTable::WET_CV_PARAM));
 
-
-		addParam(createParamCentered<VektronixInfiniteBigKnob>(mm2px(Vec(10.25, 22.476)), module, WaterTable::POSITION_IN_L_PARAM));
-		addParam(createParamCentered<VektronixInfiniteBigKnob>(mm2px(Vec(39.546, 22.476)), module, WaterTable::POSITION_IN_R_PARAM));
-		addParam(createParamCentered<VektronixInfiniteBigKnob>(mm2px(Vec(39.546, 93.743)), module, WaterTable::POSITION_OUT_R_PARAM));
+		addParam(createParamCentered<VektronixInfiniteBigKnob>(mm2px(Vec(10.25, 24.063)), module, WaterTable::POSITION_IN_L_PARAM));
+		addParam(createParamCentered<VektronixInfiniteBigKnob>(mm2px(Vec(39.546, 24.063)), module, WaterTable::POSITION_IN_R_PARAM));
 		addParam(createParamCentered<VektronixInfiniteBigKnob>(mm2px(Vec(10.25, 94.063)), module, WaterTable::POSITION_OUT_L_PARAM));
+		addParam(createParamCentered<VektronixInfiniteBigKnob>(mm2px(Vec(39.546, 94.063)), module, WaterTable::POSITION_OUT_R_PARAM));
 
-		addParam(createParamCentered<VektronixBigKnobDark>(mm2px(Vec(110.877, 81.989)), module, WaterTable::WET_PARAM));
-		addParam(createParamCentered<VektronixBigKnobDark>(mm2px(Vec(90.61, 82.107)), module, WaterTable::DRY_PARAM));
-		addParam(createParamCentered<VektronixBigKnobDark>(mm2px(Vec(70.624, 106.676)), module, WaterTable::TIMESTEP_PARAM));
+		addParam(createParamCentered<VektronixBigKnobDark>(mm2px(Vec(69.566, 109.631)), module, WaterTable::TIMESTEP_PARAM));
+		addParam(createParamCentered<VektronixBigKnobDark>(mm2px(Vec(110.538, 81.989)), module, WaterTable::WET_PARAM));
+		addParam(createParamCentered<VektronixBigKnobDark>(mm2px(Vec(91.0, 82.107)), module, WaterTable::DRY_PARAM));
 
-		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(6.25, 38.885)), module, WaterTable::PROBE_SIGMA_IN_L_PARAM));
-		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(35.546, 38.946)), module, WaterTable::PROBE_SIGMA_IN_R_PARAM));
-		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(6.25, 110.41)), module, WaterTable::PROBE_SIGMA_OUT_L_PARAM));
-		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(35.087, 110.41)), module, WaterTable::PROBE_SIGMA_OUT_R_PARAM));
-		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(115.36, 119.037)), module, WaterTable::LOW_CUT_PARAM));
-		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(86.28, 119.065)), module, WaterTable::DAMPING_PARAM));
-		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(95.909, 119.072)), module, WaterTable::DECAY_PARAM));
-		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(105.694, 119.072)), module, WaterTable::FEEDBACK_PARAM));
-		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(35.546, 51.104)), module, WaterTable::INPUT_GAIN_R_PARAM));
-		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(6.25, 51.104)), module, WaterTable::INPUT_GAIN_L_PARAM));
+		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(15.222, 40.64)), module, WaterTable::PROBE_SIGMA_IN_L_PARAM));
+		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(44.176, 40.64)), module, WaterTable::PROBE_SIGMA_IN_R_PARAM));
+		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(15.222, 110.41)), module, WaterTable::PROBE_SIGMA_OUT_L_PARAM));
+		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(44.176, 110.41)), module, WaterTable::PROBE_SIGMA_OUT_R_PARAM));
+		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(83.969, 112.384)), module, WaterTable::DAMPING_PARAM));
+		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(94.324, 112.392)), module, WaterTable::DECAY_PARAM));
+		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(104.848, 112.392)), module, WaterTable::FEEDBACK_PARAM));
+		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(115.382, 112.392)), module, WaterTable::LOW_CUT_PARAM));
+		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(15.222, 52.798)), module, WaterTable::INPUT_GAIN_L_PARAM));
+		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(44.176, 52.798)), module, WaterTable::INPUT_GAIN_R_PARAM));
 
-		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(23.75, 89.105)), module, WaterTable::POSITION_OUT_L_CV_PARAM));
-		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(53.046, 89.105)), module, WaterTable::POSITION_OUT_R_CV_PARAM));
-		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(115.627, 93.843)), module, WaterTable::WET_CV_PARAM));
-		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(95.36, 93.962)), module, WaterTable::DRY_CV_PARAM));
-		//addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(138.866, 101.959)), module, WaterTable::TIMESTEP_CV_PARAM));
-		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(115.371, 103.499)), module, WaterTable::LOW_CUT_CV_PARAM));
-		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(86.081, 103.535)), module, WaterTable::DAMPING_CV_PARAM));
-		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(95.92, 103.535)), module, WaterTable::DECAY_CV_PARAM));
-		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(105.705, 103.535)), module, WaterTable::FEEDBACK_CV_PARAM));
-		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(15.0, 110.41)), module, WaterTable::PROBE_SIGMA_OUT_L_CV_PARAM));
-		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(43.867, 110.41)), module, WaterTable::PROBE_SIGMA_OUT_R_CV_PARAM));
-		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(15.0, 38.989)), module, WaterTable::PROBE_SIGMA_IN_L_CV_PARAM));
-		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(44.296, 39.05)), module, WaterTable::PROBE_SIGMA_IN_R_CV_PARAM));
-		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(15.0, 51.104)), module, WaterTable::INPUT_GAIN_L_CV_PARAM));
-		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(44.255, 51.104)), module, WaterTable::INPUT_GAIN_R_CV_PARAM));
-		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(23.75, 17.421)), module, WaterTable::POSITION_IN_L_CV_PARAM));
-		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(53.046, 17.421)), module, WaterTable::POSITION_IN_R_CV_PARAM));
-
-
-		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(15.0, 7.244)), module, WaterTable::PROBE_IN_L_INPUT));
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(15.222, 7.244)), module, WaterTable::PROBE_IN_L_INPUT));
 		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(44.296, 7.244)), module, WaterTable::PROBE_IN_R_INPUT));
-		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(23.75, 26.34)), module, WaterTable::PROBE_POSITION_IN_L_INPUT));
-		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(53.046, 26.34)), module, WaterTable::PROBE_POSITION_IN_R_INPUT));
-		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(53.046, 39.053)), module, WaterTable::PROBE_SIGMA_IN_R_INPUT));
-		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(23.75, 39.114)), module, WaterTable::PROBE_SIGMA_IN_L_INPUT));
-		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(23.75, 51.104)), module, WaterTable::INPUT_GAIN_L_INPUT));
-		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(53.046, 51.104)), module, WaterTable::INPUT_GAIN_R_INPUT));
-		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(106.877, 93.843)), module, WaterTable::WET_INPUT));
-		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(86.61, 93.962)), module, WaterTable::DRY_INPUT));
-		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(23.75, 98.021)), module, WaterTable::PROBE_POSITION_OUT_L_INPUT));
-		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(53.046, 98.021)), module, WaterTable::PROBE_POSITION_OUT_R_INPUT));
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(23.75, 28.063)), module, WaterTable::PROBE_POSITION_IN_L_INPUT));
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(53.046, 28.063)), module, WaterTable::PROBE_POSITION_IN_R_INPUT));
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(23.75, 40.64)), module, WaterTable::PROBE_SIGMA_IN_L_INPUT));
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(53.046, 40.64)), module, WaterTable::PROBE_SIGMA_IN_R_INPUT));
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(23.75, 52.691)), module, WaterTable::INPUT_GAIN_L_INPUT));
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(53.046, 52.691)), module, WaterTable::INPUT_GAIN_R_INPUT));
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(87.0, 93.843)), module, WaterTable::DRY_INPUT));
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(106.538, 93.843)), module, WaterTable::WET_INPUT));
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(23.75, 98.063)), module, WaterTable::PROBE_POSITION_OUT_L_INPUT));
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(53.046, 98.063)), module, WaterTable::PROBE_POSITION_OUT_R_INPUT));
 		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(23.75, 110.41)), module, WaterTable::PROBE_SIGMA_OUT_L_INPUT));
-		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(52.971, 110.41)), module, WaterTable::PROBE_SIGMA_OUT_R_INPUT));
-		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(115.371, 110.857)), module, WaterTable::LOW_CUT_INPUT));
-		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(86.081, 110.892)), module, WaterTable::DAMPING_INPUT));
-		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(95.92, 110.892)), module, WaterTable::DECAY_INPUT));
-		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(105.705, 110.892)), module, WaterTable::FEEDBACK_INPUT));
-		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(70.671, 119.065)), module, WaterTable::TIMESTEP_INPUT));
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(53.046, 110.41)), module, WaterTable::PROBE_SIGMA_OUT_R_INPUT));
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(73.56, 120.947)), module, WaterTable::TIMESTEP_INPUT));
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(83.969, 120.947)), module, WaterTable::DAMPING_INPUT));
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(94.324, 120.947)), module, WaterTable::DECAY_INPUT));
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(104.848, 120.947)), module, WaterTable::FEEDBACK_INPUT));
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(115.382, 120.947)), module, WaterTable::LOW_CUT_INPUT));
 
-		addOutput(createOutputCentered<VektronixPortBorderlessDark>(mm2px(Vec(15.0, 78.379)), module, WaterTable::PROBE_OUT_L_OUTPUT));
-		addOutput(createOutputCentered<VektronixPortBorderlessDark>(mm2px(Vec(44.446, 78.379)), module, WaterTable::PROBE_OUT_R_OUTPUT));
+		addOutput(createOutputCentered<VektronixPortBorderlessDark>(mm2px(Vec(15.222, 78.379)), module, WaterTable::PROBE_OUT_L_OUTPUT));
+		addOutput(createOutputCentered<VektronixPortBorderlessDark>(mm2px(Vec(44.296, 78.379)), module, WaterTable::PROBE_OUT_R_OUTPUT));
+
 
 		addChild(createLightCentered<SmallLight<RedLight>>(mm2px(Vec(118.795, 4.673)), module, WaterTable::EOC_LIGHT));
 		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(55.628, 5.978)), module, WaterTable::POS_MODE_LIGHT));
 		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(55.628, 8.295)), module, WaterTable::MOD_MODE_LIGHT));
-		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(15.033, 60.304)), module, WaterTable::INTEGRAL_INPUT_L_LIGHT));
-		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(44.155, 60.304)), module, WaterTable::INTEGRAL_INPUT_R_LIGHT));
-		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(26.398, 60.371)), module, WaterTable::ADDITIVE_L_LIGHT));
-		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(55.52, 60.371)), module, WaterTable::ADDITIVE_R_LIGHT));
-		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(15.033, 63.227)), module, WaterTable::DIFFERENTIAL_INPUT_L_LIGHT));
-		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(44.155, 63.227)), module, WaterTable::DIFFERENTIAL_INPUT_R_LIGHT));
-		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(15.033, 66.149)), module, WaterTable::SINC_INPUT_L_LIGHT));
-		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(44.155, 66.149)), module, WaterTable::SINC_INPUT_R_LIGHT));
-		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(26.398, 66.252)), module, WaterTable::MULTIPLICATIVE_L_LIGHT));
-		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(55.52, 66.252)), module, WaterTable::MULTIPLICATIVE_R_LIGHT));
-		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(11.437, 121.734)), module, WaterTable::INTEGRAL_OUTPUT_L_LIGHT));
-		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(17.915, 121.734)), module, WaterTable::DIFFERENTIAL_OUTPUT_L_LIGHT));
-		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(24.393, 121.734)), module, WaterTable::SINC_OUTPUT_L_LIGHT));
-		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(40.383, 121.734)), module, WaterTable::INTEGRAL_OUTPUT_R_LIGHT));
-		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(46.861, 121.734)), module, WaterTable::DIFFERENTIAL_OUTPUT_R_LIGHT));
-		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(53.339, 121.734)), module, WaterTable::SINC_OUTPUT_R_LIGHT));
-
+		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(26.398, 63.259)), module, WaterTable::ADDITIVE_L_LIGHT));
+		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(15.033, 63.278)), module, WaterTable::INTEGRAL_INPUT_L_LIGHT));
+		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(44.155, 63.278)), module, WaterTable::INTEGRAL_INPUT_R_LIGHT));
+		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(55.52, 63.278)), module, WaterTable::ADDITIVE_R_LIGHT));
+		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(15.033, 66.2)), module, WaterTable::DIFFERENTIAL_INPUT_L_LIGHT));
+		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(44.155, 66.2)), module, WaterTable::DIFFERENTIAL_INPUT_R_LIGHT));
+		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(15.033, 69.123)), module, WaterTable::SINC_INPUT_L_LIGHT));
+		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(44.155, 69.123)), module, WaterTable::SINC_INPUT_R_LIGHT));
+		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(55.52, 69.123)), module, WaterTable::MULTIPLICATIVE_R_LIGHT));
+		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(26.398, 69.141)), module, WaterTable::MULTIPLICATIVE_L_LIGHT));
+		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(11.437, 123.322)), module, WaterTable::INTEGRAL_OUTPUT_L_LIGHT));
+		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(17.915, 123.322)), module, WaterTable::DIFFERENTIAL_OUTPUT_L_LIGHT));
+		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(24.393, 123.322)), module, WaterTable::SINC_OUTPUT_L_LIGHT));
+		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(40.383, 123.322)), module, WaterTable::INTEGRAL_OUTPUT_R_LIGHT));
+		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(46.861, 123.322)), module, WaterTable::DIFFERENTIAL_OUTPUT_R_LIGHT));
+		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(53.339, 123.322)), module, WaterTable::SINC_OUTPUT_R_LIGHT));
 
 	}
 };

@@ -93,7 +93,8 @@ struct CVParamInput {
 		if (dirty || paramCacheIn != gain) {
 			dirty = false;
 			paramCacheIn = gain;
-			res = simd::rescale(std::pow(2.0, gain * 8.f), 0.00390625, 256.0, min, max); // scale from (2^-8, 2^8) to (min, max)
+			//res = simd::rescale(std::pow(2.0, gain * 8.f), 0.00390625, 256.0, min, max); // scale from (2^-8, 2^8) to (min, max)
+			res = simd::rescale(std::pow(2.0, gain * 4.f), 0.0625, 16.0, min, max); // scale from (2^-4, 2^4) to (min, max)
 			paramCacheOut = res;
 		}
 

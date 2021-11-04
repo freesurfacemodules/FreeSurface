@@ -37,7 +37,7 @@ struct WaterTableModeButton : FreeSurfaceLogoToggleDark {
 };
 
 template <class TModule>
-struct WaterTableAdditiveModeLToggle : VektronixToggleDark {
+struct WaterTableAdditiveModeLToggle : VektronixRoundToggleDark {
     TModule* module;
     WaterTableAdditiveModeLToggle() {
         this->momentary = true;
@@ -57,7 +57,7 @@ struct WaterTableAdditiveModeLToggle : VektronixToggleDark {
 };
 
 template <class TModule>
-struct WaterTableAdditiveModeRToggle : VektronixToggleDark {
+struct WaterTableAdditiveModeRToggle : VektronixRoundToggleDark {
     TModule* module;
     WaterTableAdditiveModeRToggle() {
         this->momentary = true;
@@ -77,7 +77,7 @@ struct WaterTableAdditiveModeRToggle : VektronixToggleDark {
 };
 
 template <class TModule>
-struct WaterTableInputProbeTypeLToggle : VektronixToggleDark {
+struct WaterTableInputProbeTypeLToggle : VektronixRoundToggleDark {
     TModule* module;
     WaterTableInputProbeTypeLToggle() {
         this->momentary = true;
@@ -97,7 +97,7 @@ struct WaterTableInputProbeTypeLToggle : VektronixToggleDark {
 };
 
 template <class TModule>
-struct WaterTableInputProbeTypeRToggle : VektronixToggleDark {
+struct WaterTableInputProbeTypeRToggle : VektronixRoundToggleDark {
     TModule* module;
     WaterTableInputProbeTypeRToggle() {
         this->momentary = true;
@@ -117,7 +117,7 @@ struct WaterTableInputProbeTypeRToggle : VektronixToggleDark {
 };
 
 template <class TModule>
-struct WaterTableOutputProbeTypeLToggle : VektronixToggleDark {
+struct WaterTableOutputProbeTypeLToggle : VektronixRoundToggleDark {
     TModule* module;
     WaterTableOutputProbeTypeLToggle() {
         this->momentary = true;
@@ -137,7 +137,7 @@ struct WaterTableOutputProbeTypeLToggle : VektronixToggleDark {
 };
 
 template <class TModule>
-struct WaterTableOutputProbeTypeRToggle : VektronixToggleDark {
+struct WaterTableOutputProbeTypeRToggle : VektronixRoundToggleDark {
     TModule* module;
     WaterTableOutputProbeTypeRToggle() {
         this->momentary = true;
@@ -159,12 +159,14 @@ struct WaterTableOutputProbeTypeRToggle : VektronixToggleDark {
 template <class TModule, size_t CHANNEL_SIZE, size_t CHANNEL_SIZE_FLOATS>
 struct WaterTableDisplay : TransparentWidget {
 	TModule* module;
-	const float r = 0.8;
+	const float RADIUS = 0.8;
+	const float MOD_RING_R = 0.5;
+	const float Y_OFFSET = -6.0;
 	Rect b;
 	std::shared_ptr<Font> font;
 	const NVGcolor orange_red_bright = nvgRGBA(0xf5, 0x39, 0x0a, 0xff);
 	const NVGcolor orange_red = nvgRGBA(0xd0, 0x28, 0x0a, 0xff);
-	const NVGcolor ember_orange = nvgRGBA(0xe8, 0xde, 0x1e, 0xff);
+	const NVGcolor ember_orange = nvgRGBA(0xff, 0xcf, 0x3f, 0xff);
 	const NVGcolor hot_white = nvgRGBA(0xff, 0xff, 0xeb, 0xff);
 	const NVGcolor dark_grey = nvgRGBA(0x10, 0x10, 0x10, 0xff);
 	const int HISTORY_SIZE = 16;
@@ -187,7 +189,6 @@ struct WaterTableDisplay : TransparentWidget {
 		b = Rect(Vec(0, 0), box.size);
 	}
 
-	#define Y_OFFSET 20.0
 	Vec scaleToBoxByX(Vec v) {
 		Vec p;
 		p.x = rescale(v.x, -1.f, 1.f, b.pos.x, b.pos.x + b.size.x);
@@ -202,7 +203,7 @@ struct WaterTableDisplay : TransparentWidget {
 	}
 
 	Vec circle(float i) {
-		return circle(i, r);
+		return circle(i, RADIUS);
 	}
 
 	Vec getMarkerStartFromPos(float pos) {	
@@ -230,7 +231,7 @@ struct WaterTableDisplay : TransparentWidget {
 
 	void drawWaveform(const DrawArgs& args, std::vector<float_4> &buffer, int index) {
 		float step = static_cast<float>(index) / static_cast<float>(HISTORY_SIZE-1);
-
+		nvgScissor(args.vg, b.pos.x, b.pos.y, b.size.x, b.size.y);
 		nvgBeginPath(args.vg);
 
 
@@ -291,6 +292,8 @@ struct WaterTableDisplay : TransparentWidget {
 		float alpha = alpha_scale*simd::pow(step, 2.0);
 		nvgFillColor(args.vg, nvgTransRGBAf(gradient(0.0), alpha));
 		nvgFill(args.vg);
+
+		nvgResetScissor(args.vg);
 		
 	}
 
@@ -390,20 +393,71 @@ struct WaterTableDisplay : TransparentWidget {
 		nvgGlobalCompositeOperation(args.vg, NVG_LIGHTER);
 		{
 			Vec p = getMarkerStartFromPos(pos);
-			Vec n = getMarkerStartFromPos(pos, r*0.6);
+			Vec n = getMarkerStartFromPos(pos, RADIUS*0.6);
 			drawTextBox(args, p, n, text);
 		}
 		nvgStroke(args.vg);
 	}
 
-	void drawModelName(const DrawArgs& args) {
-		Vec p = b.pos.plus(Vec(10,10));
+	float modRange(float pos, float width, float amp) {
+		//return 2.0*(pos - (CHANNEL_SIZE_FLOATS / 2.0)) / CHANNEL_SIZE_FLOATS;
 
+		amp = rack::simd::rescale(amp,-10.0,10.0,-1.0,1.0);
+		float pos_to_mod_offset = 2.0*(pos - (CHANNEL_SIZE_FLOATS / 2.0)) / CHANNEL_SIZE_FLOATS;
+		return width * (amp + pos_to_mod_offset) / 4.0;
+	}
+
+	void drawModInfo(const DrawArgs& args, float pos, float width, float amp) {
+		float modInput = modRange(pos, width, amp);
+		nvgBeginPath(args.vg);
+		NVGcolor col = nvgLerpRGBA(orange_red, ember_orange, simd::pow(simd::abs(modInput), 2.0));
+		nvgStrokeColor(args.vg, col);
+		Vec center = Vec(0.0, 0.0);
+		center = scaleToBoxByX(center);
+		Vec side = Vec(MOD_RING_R, 0.0);
+		side = scaleToBoxByX(side);
+		float radius = side.minus(center).norm();
+		float angle = M_PI * modInput;
+		const float start_angle = M_PI/2.0;
+		NVGwinding dir;
+		if (math::sgn(angle) > 0) {
+			dir = NVG_CW;
+		} else {
+			dir = NVG_CCW;
+		}
+		nvgArc(args.vg, center.x, center.y, radius, start_angle, start_angle + angle, dir);
+		nvgStrokeWidth(args.vg, 5.0);
+		nvgStroke(args.vg);
+		nvgGlobalCompositeOperation(args.vg, NVG_LIGHTER);
+
+	}
+
+	void drawModelName(const DrawArgs& args) {
+		Vec t_box = b.size.minus(Vec(0,20));
+		Vec mid = Vec(b.size.x/2.0, 0.0);
+		Vec p = t_box.plus(Vec(mid.x,8.0)).minus(Vec(b.size.x,0));
+
+
+		nvgFillColor(args.vg, orange_red_bright);
+		nvgBeginPath(args.vg);
+		nvgGlobalCompositeOperation(args.vg, NVG_LIGHTER);
+		nvgRect(args.vg, 0.0, t_box.y, b.size.x, 10.0);
+		nvgClosePath(args.vg);
+		nvgFill(args.vg);
+		nvgGlobalCompositeOperation(args.vg, NVG_LIGHTER);
+
+		nvgBeginPath(args.vg);
+		nvgGlobalCompositeOperation(args.vg, NVG_XOR);
+		nvgFillColor(args.vg, hot_white);
+		nvgGlobalCompositeOperation(args.vg, NVG_XOR);
 		nvgFontSize(args.vg, 11);
 		nvgFontFaceId(args.vg, font->handle);
-		nvgFillColor(args.vg, orange_red_bright);
+		nvgTextAlign(args.vg, NVG_ALIGN_CENTER);
 		const char* text = module->waveChannel.getModelString();
 		nvgText(args.vg, p.x, p.y, text, NULL);
+		nvgGlobalCompositeOperation(args.vg, NVG_XOR);
+		nvgFill(args.vg);
+		nvgGlobalCompositeOperation(args.vg, NVG_XOR);
 
 	}
 
@@ -420,7 +474,13 @@ struct WaterTableDisplay : TransparentWidget {
 		const char* L_OUT = "L_OUT";
 		const char* R_OUT = "R_OUT";
 		drawMarker(args, pos_in_L, L_IN, true, true);
-		drawMarker(args, pos_in_R, R_IN, false, true);
+		if (module->waveChannel.isModMode()) {
+			float amp_in_R = module->waveChannel.amp_in_R;
+			float sig_in_R = module->sig_in_R_param.getValue();
+			drawModInfo(args, pos_in_R, sig_in_R, amp_in_R);
+		} else {
+			drawMarker(args, pos_in_R, R_IN, false, true);
+		}		
 		drawMarker(args, pos_out_L, L_OUT, true, false);
 		drawMarker(args, pos_out_R, R_OUT, false, false);
 

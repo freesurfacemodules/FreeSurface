@@ -29,6 +29,15 @@ struct VektronixToggleDark : SvgSwitch {
 	}
 };
 
+struct VektronixRoundToggleDark : SvgSwitch {
+	VektronixRoundToggleDark() {
+		addFrame(APP->window->loadSvg(asset::plugin(pluginInstance, "res/VektronixRoundButtonUpDark.svg")));
+		addFrame(APP->window->loadSvg(asset::plugin(pluginInstance, "res/VektronixRoundButtonDownDark.svg")));
+		shadow->opacity = 0.f;
+	}
+};
+
+
 struct FreeSurfaceLogoToggleDark : SvgSwitch {
 	FreeSurfaceLogoToggleDark() {
 		addFrame(APP->window->loadSvg(asset::plugin(pluginInstance, "res/FreeSurfaceLogoButtonUpDark.svg")));
