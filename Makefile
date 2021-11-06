@@ -1,6 +1,6 @@
 RACK_DIR ?= ../..
 
-FLAGS += -Idep/include
+FLAGS += -Idep/include -Isrc/dep/include
 SOURCES += $(wildcard src/*.cpp)
 DISTRIBUTABLES += $(wildcard LICENSE*) res
 
