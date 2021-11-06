@@ -10,6 +10,6 @@ void init(rack::Plugin* p) {
 	//p->addModel(modelNorms);
 	//p->addModel(modelMeans);
 	//p->addModel(modelLeakyIntegrator);
-	p->addModel(modelVektronix);
+	//p->addModel(modelVektronix);
 	p->addModel(modelWaterTable);
 }

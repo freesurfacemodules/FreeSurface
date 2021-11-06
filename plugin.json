@@ -13,15 +13,9 @@
   "changelogUrl": "",
   "modules": [
     {
-      "slug": "FreeSurface-Vektronix",
-      "name": "Vektronix",
-      "description": "Vector graphics oscillator. Load an SVG and play back as X-Y waveforms.",
-      "tags": ["Oscillator", "Visual"]
-    },
-    {
       "slug": "FreeSurface-WaterTable",
       "name": "WaterTable",
-      "description": "Dynamical system resonator",
+      "description": "Physical modeling system with a fully analog design",
       "tags": ["Distortion", "Filter", "Panning", "Ring modulator", "Physical modeling"]
     }
   ]

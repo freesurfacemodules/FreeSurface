@@ -1233,60 +1233,112 @@ struct WaterTableWidget : ModuleWidget {
 		setModule(module);
 		setPanel(APP->window->loadSvg(asset::plugin(pluginInstance, "res/WaterTable.svg")));
 
+		/*  lambas below MUST BE pass by value or we segfault when the reference goes out of scope.
+			this way of setting up the buttons is somewhat bizarre, but it does reduce boilerplate substantially.
+		*/
 		{
 			//addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(69.566, 83.327)), module, WaterTable::MODEL_BUTTON_PARAM));
-			WaterTableModeButton<WaterTable>* modelButton 
-					= createParamCentered<WaterTableModeButton<WaterTable>>(mm2px(Vec(69.566, 83.327)), module, WaterTable::MODEL_BUTTON_PARAM);
-			modelButton->module = module;
-			addParam(modelButton);
+			FreeSurfaceLogoToggleDark<WaterTable, 4>* button 
+					= createParamCentered<FreeSurfaceLogoToggleDark<WaterTable, 4>>(mm2px(Vec(69.566, 83.327)), module, WaterTable::MODEL_BUTTON_PARAM);
+			button->config(
+				"Model", 
+				std::vector<std::string>{"WAVE EQUATION", "SQUID AXON", "SCHRODINGER", "RUNGE KUTTA RK4"},
+				true, 
+				[=] () -> int { return static_cast<int>(module->waveChannel.model); }, 
+				[=] () -> void { module->waveChannel.setNextModel(); }, 
+				module
+			);
+			addParam(button);
 		}
 
 		{
 			//addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(18.94, 66.2)), module, WaterTable::MULTIPLICATIVE_BUTTON_L_PARAM));
-			WaterTableAdditiveModeLToggle<WaterTable>* modelButton 
-					= createParamCentered<WaterTableAdditiveModeLToggle<WaterTable>>(mm2px(Vec(18.94, 66.2)), module, WaterTable::MULTIPLICATIVE_BUTTON_L_PARAM);
-			modelButton->module = module;
-			addParam(modelButton);
+			RoundToggleDark<WaterTable, 2>* button 
+					= createParamCentered<RoundToggleDark<WaterTable, 2>>(mm2px(Vec(18.94, 66.2)), module, WaterTable::MULTIPLICATIVE_BUTTON_L_PARAM);
+			button->config(
+				"Left Input Mode",
+				std::vector<std::string>{"ADDITIVE", "MULTIPLICATIVE"},
+				true, 
+				[=] () -> int { return module->waveChannel.additive_mode_L ? 1 : 0; }, 
+				[=] () -> void { module->waveChannel.toggleAdditiveModeL(); }, 
+				module
+			);
+			addParam(button);
 		}
 
 		{
 			//addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(48.062, 66.2)), module, WaterTable::MULTIPLICATIVE_BUTTON_R_PARAM));
-			WaterTableAdditiveModeRToggle<WaterTable>* modelButton 
-					= createParamCentered<WaterTableAdditiveModeRToggle<WaterTable>>(mm2px(Vec(48.062, 66.2)), module, WaterTable::MULTIPLICATIVE_BUTTON_R_PARAM);
-			modelButton->module = module;
-			addParam(modelButton);
+			RoundToggleDark<WaterTable, 3>* button 
+					= createParamCentered<RoundToggleDark<WaterTable, 3>>(mm2px(Vec(48.062, 66.2)), module, WaterTable::MULTIPLICATIVE_BUTTON_R_PARAM);
+			button->config(
+				"Right Input Mode",
+				std::vector<std::string>{"ADDITIVE", "MULTIPLICATIVE", "DISABLED"},
+				true, 
+				[=] () -> int { return module->waveChannel.isModMode() ? 2 : (module->waveChannel.additive_mode_R ? 1 : 0); }, 
+				[=] () -> void { if (!module->waveChannel.isModMode()) { module->waveChannel.toggleAdditiveModeR(); } }, 
+				module
+			);
+			addParam(button);
 		}
 
 		{
 			//addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(5.018, 66.198)), module, WaterTable::INPUT_PROBE_TYPE_BUTTON_L_PARAM));
-			WaterTableInputProbeTypeLToggle<WaterTable>* modelButton 
-					= createParamCentered<WaterTableInputProbeTypeLToggle<WaterTable>>(mm2px(Vec(5.018, 66.198)), module, WaterTable::INPUT_PROBE_TYPE_BUTTON_L_PARAM);
-			modelButton->module = module;
-			addParam(modelButton);
+			RoundToggleDark<WaterTable, 3>* button 
+					= createParamCentered<RoundToggleDark<WaterTable, 3>>(mm2px(Vec(5.018, 66.198)), module, WaterTable::INPUT_PROBE_TYPE_BUTTON_L_PARAM);
+			button->config(
+				"Left Input Shape",
+				std::vector<std::string>{"INTEGRAL", "DIFFERENTIAL", "SINC"},
+				true, 
+				[=] () -> int { return static_cast<int>(module->waveChannel.input_probe_type_L); }, 
+				[=] () -> void { module->waveChannel.toggleInputProbeTypeL(); }, 
+				module
+			);
+			addParam(button);
 		}
 
 		{
 			//addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(34.14, 66.198)), module, WaterTable::INPUT_PROBE_TYPE_BUTTON_R_PARAM));
-			WaterTableInputProbeTypeRToggle<WaterTable>* modelButton 
-					= createParamCentered<WaterTableInputProbeTypeRToggle<WaterTable>>(mm2px(Vec(34.14, 66.198)), module, WaterTable::INPUT_PROBE_TYPE_BUTTON_R_PARAM);
-			modelButton->module = module;
-			addParam(modelButton);
+			RoundToggleDark<WaterTable, 4>* button 
+					= createParamCentered<RoundToggleDark<WaterTable, 4>>(mm2px(Vec(34.14, 66.198)), module, WaterTable::INPUT_PROBE_TYPE_BUTTON_R_PARAM);
+			button->config(
+				"Right Input Shape",
+				std::vector<std::string>{"INTEGRAL", "DIFFERENTIAL", "SINC", "DISABLED"},
+				true, 
+				[=] () -> int { return module->waveChannel.isModMode() ? 3 : static_cast<int>(module->waveChannel.input_probe_type_R); }, 
+				[=] () -> void { if (!module->waveChannel.isModMode()) { module->waveChannel.toggleInputProbeTypeR(); } }, 
+				module
+			);
+			addParam(button);
 		}
 
 		{
 			//addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(4.991, 121.739)), module, WaterTable::OUTPUT_PROBE_TYPE_BUTTON_L_PARAM));
-			WaterTableOutputProbeTypeLToggle<WaterTable>* modelButton 
-					= createParamCentered<WaterTableOutputProbeTypeLToggle<WaterTable>>(mm2px(Vec(4.991, 121.739)), module, WaterTable::OUTPUT_PROBE_TYPE_BUTTON_L_PARAM);
-			modelButton->module = module;
-			addParam(modelButton);
+			RoundToggleDark<WaterTable, 3>* button 
+					= createParamCentered<RoundToggleDark<WaterTable, 3>>(mm2px(Vec(4.991, 121.739)), module, WaterTable::OUTPUT_PROBE_TYPE_BUTTON_L_PARAM);
+			button->config(
+				"Left Output Shape",
+				std::vector<std::string>{"INTEGRAL", "DIFFERENTIAL", "SINC"},
+				true, 
+				[=] () -> int { return static_cast<int>(module->waveChannel.output_probe_type_L); }, 
+				[=] () -> void { module->waveChannel.toggleOutputProbeTypeL(); }, 
+				module
+			);
+			addParam(button);
 		}
 
 		{
 			//addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(34.287, 121.739)), module, WaterTable::OUTPUT_PROBE_TYPE_BUTTON_R_PARAM));
-			WaterTableOutputProbeTypeRToggle<WaterTable>* modelButton 
-					= createParamCentered<WaterTableOutputProbeTypeRToggle<WaterTable>>(mm2px(Vec(34.287, 121.739)), module, WaterTable::OUTPUT_PROBE_TYPE_BUTTON_R_PARAM);
-			modelButton->module = module;
-			addParam(modelButton);
+			RoundToggleDark<WaterTable, 3>* button 
+					= createParamCentered<RoundToggleDark<WaterTable, 3>>(mm2px(Vec(34.287, 121.739)), module, WaterTable::OUTPUT_PROBE_TYPE_BUTTON_R_PARAM);
+			button->config(
+				"Right Output Shape",
+				std::vector<std::string>{"INTEGRAL", "DIFFERENTIAL", "SINC"},
+				true, 
+				[=] () -> int { return static_cast<int>(module->waveChannel.output_probe_type_R); }, 
+				[=] () -> void { module->waveChannel.toggleOutputProbeTypeR(); }, 
+				module
+			);
+			addParam(button);
 		}
 
 		{

@@ -16,7 +16,7 @@ extern Plugin* pluginInstance;
 //extern Model* modelNorms;
 //extern Model* modelMeans;
 //extern Model* modelLeakyIntegrator;
-extern Model* modelVektronix;
+//extern Model* modelVektronix;
 extern Model* modelWaterTable;
 
 
