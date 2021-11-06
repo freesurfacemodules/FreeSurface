@@ -2,7 +2,7 @@
 
 ### What is WaterTable?
 
-WaterTable is a physical modeling system that simulates several different physical systems in a circular channel. These systems are:
+WaterTable is a physical modeling system that simulates several different physical systems in a circular channel. The output of WaterTable is the direct result of sampling the state of a simulated wave at a particular position in real time. WaterTable uses a fully analog design, and does not use digital delays or reverbs. The physical systems in WaterTable are:
 
 * The Wave Equation
 
@@ -144,7 +144,7 @@ WaterTable enables you to interact with these systems in real time with a variet
 
 #### What Does This Mode Do?
 
-​		From a practical perspective, this mode can be used to create surprisingly realistic recreations of plucked string instruments, as well as weird, unconventional modulation effects.
+​		From a practical perspective, this mode can be used to create surprisingly realistic recreations of plucked string instruments, as well as weird, unconventional modulation effects. It can also be used as a *fully analog* delay for Karplus-Strong style synthesis.
 
 ​		From a theoretical perspective, the advection equation describes how substances are transported around by a moving fluid. The fluid is moving at a particular speed, and whatever substance is being pushed around moves with it. In this mode, the right input probe controls the fluid speed, and the left input probe is injecting the "substance" that gets pushed around. For example, this means that a pulse that enters the left input probe gets added into the channel, and then it rotates around the channel, either clockwise or counterclockwise, according to the settings of the right input probe.
 
@@ -158,7 +158,7 @@ WaterTable enables you to interact with these systems in real time with a variet
 
 ##### Mod Bias
 
-​		The MOD BIAS parameter is the *base* rotation speed. This is a constant value that controls how fast and in which direction a pulse (or any other input) that enters the left input probe rotates around the WaterTable channel. The MOD BIAS parameter *biases* the speed and in one direction or another regardless of whether there is an input connected to the right input probe. When an input is connected to the right input probe, the MOD BIAS is added to the value coming from the connected input.
+​		The MOD BIAS parameter is the *base* rotation speed. This is a constant value that controls how fast and in which direction a pulse (or any other input) that enters the left input probe rotates around the WaterTable channel. The MOD BIAS parameter *biases* the speed in one direction or another regardless of whether there is an input connected to the right input probe. When an input is connected to the right input probe, the MOD BIAS is added to the value coming from the connected input.
 
 ##### Speed
 
@@ -170,7 +170,7 @@ WaterTable enables you to interact with these systems in real time with a variet
 
 #### The Display in Modulation Mode
 
-​		When in modulation mode, the WaterTable display changes. The right input is removed, and is replace by an animated dial inside of the WaterTable channel visualizer. The dial indicates the current speed and direction of rotation, and will move in response to input connected to the right input probe.
+​		When in modulation mode, the WaterTable display changes. The right input is removed, and is replaced by an animated dial inside of the WaterTable channel visualizer. The dial indicates the current speed and direction of rotation, and will move in response to input connected to the right input probe.
 
 ![image-20211104211917468](./images/image-20211104211917468.png)
 
