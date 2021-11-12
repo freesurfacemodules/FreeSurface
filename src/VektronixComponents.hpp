@@ -9,7 +9,7 @@ extern Plugin* pluginInstance;
 template <typename TBase>
 struct VektronixDiskLight : RectangleLight<TBase> {
 	VektronixDiskLight() {
-		this->box.size = app::mm2px(math::Vec(3.0, 1.0));
+		this->box.size = window::mm2px(math::Vec(3.0, 1.0));
 	}
 };
 
@@ -145,6 +145,7 @@ struct VektronixInfiniteBigKnob : app::SvgKnob {
 	}
 
 	void onChange(const event::Change& e) override {
+		ParamQuantity* paramQuantity = getParamQuantity();
 		// Re-transform the widget::TransformWidget
 		if (paramQuantity) {
 			float angle;
@@ -170,11 +171,13 @@ struct VektronixInfiniteBigKnob : app::SvgKnob {
 	// unbounded knobs don't reset or randomize,
 	// so we need to override
 	void onDoubleClick(const event::DoubleClick& e) override {
+		ParamQuantity* paramQuantity = getParamQuantity();
 		if (paramQuantity) {
 			float oldValue = paramQuantity->getValue();
-			reset();
-			// Here's another way of doing it, but either works.
-			// paramQuantity->getParam()->reset();
+
+			float value = paramQuantity->getDefaultValue();
+			paramQuantity->setValue(value);
+
 			float newValue = paramQuantity->getValue();
 
 			if (oldValue != newValue) {
@@ -189,23 +192,7 @@ struct VektronixInfiniteBigKnob : app::SvgKnob {
 			}
 		}
 	}
-	void reset() override {
-		if (paramQuantity) {
-			float value = paramQuantity->getDefaultValue();
-			paramQuantity->setValue(value);
-			oldValue = snapValue = paramQuantity->getValue();
-		}
-	}
 
-	// just scale to -1..1
-	// we could set the range in the constructor maybe
-	void randomize() override {
-		if (paramQuantity) {
-			float value = math::rescale(random::uniform(), 0.f, 1.f, -1.0, 1.0);
-			paramQuantity->setValue(value);
-			oldValue = snapValue = paramQuantity->getValue();
-		}
-	}
 };
 
 struct VektronixBigKnobDark : app::SvgKnob {
@@ -227,6 +214,7 @@ struct VektronixBigKnobDark : app::SvgKnob {
 	}
 
 	void onChange(const event::Change& e) override {
+		ParamQuantity* paramQuantity = getParamQuantity();
 		// Re-transform the widget::TransformWidget
 		if (paramQuantity) {
 			float angle;
@@ -270,6 +258,7 @@ struct VektronixSmallKnobDark : app::SvgKnob {
 	}
 
 	void onChange(const event::Change& e) override {
+		ParamQuantity* paramQuantity = getParamQuantity();
 		// Re-transform the widget::TransformWidget
 		if (paramQuantity) {
 			float angle;
@@ -312,6 +301,7 @@ struct VektronixTinyKnobDark : app::SvgKnob {
 	}
 
 	void onChange(const event::Change& e) override {
+		ParamQuantity* paramQuantity = getParamQuantity();
 		// Re-transform the widget::TransformWidget
 		if (paramQuantity) {
 			float angle;

@@ -994,6 +994,10 @@ struct WaterTable : Module {
 		input_gain_R_param.configExp(this, MIN_GAIN , MAX_GAIN, DEF_GAIN, "input_gain_R", "Input Gain R");
 		dry_param.configExp(this, MIN_GAIN , MAX_GAIN, MIN_GAIN , "dry", "Dry Gain");
 		wet_param.configExp(this, MIN_GAIN , MAX_GAIN, DEF_GAIN, "wet", "Wet Gain");
+		//configOutput(PROBE_OUT_L_OUTPUT, "Left output");
+		//configOutput(PROBE_OUT_R_OUTPUT, "Right output");
+		//configInput(PROBE_IN_L_INPUT, "Left input");
+		//configInput(PROBE_IN_R_INPUT, "Right input");
 		lightDivider.setDivision(16);
 	}
 
@@ -1224,6 +1228,22 @@ struct WaterTable : Module {
 		booleanFromJson(rootJ, waveChannel.additive_mode_L, "additive_mode_L");
 		booleanFromJson(rootJ, waveChannel.additive_mode_R, "additive_mode_R");
 		modelFromJson(rootJ, waveChannel.model, "model");
+	}
+
+	void onReset(const ResetEvent& e) override {
+		pos_in_L_param.reset();
+		pos_in_R_param.reset();
+		pos_out_L_param.reset();
+		pos_out_R_param.reset();
+		Module::onReset(e);
+	}
+
+	void onRandomize(const RandomizeEvent& e) override {
+		pos_in_L_param.randomize();
+		pos_in_R_param.randomize();
+		pos_out_L_param.randomize();
+		pos_out_R_param.randomize();
+		Module::onRandomize(e);
 	}
 };
 

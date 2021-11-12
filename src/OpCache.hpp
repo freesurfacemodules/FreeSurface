@@ -1,3 +1,5 @@
+#include <iostream>
+
 template <typename T, typename O>
 struct Op {
     static T op (T x) {
@@ -19,9 +21,9 @@ struct OpCache {
         if (in != last_in) {
             last_in = in;
             last_out = O::op(in);
-            std::cout << "new: ";
+            //std::cout << "new: ";
         } else {
-            std::cout << "cached: ";
+            //std::cout << "cached: ";
         }
         return last_out;
     }

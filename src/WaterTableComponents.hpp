@@ -23,16 +23,18 @@ struct NamedEnumToggle : SvgSwitch {
     std::string name;
     TEnumFunc enumFunc;
     TToggleFunc toggleFunc;
+	ui::Tooltip* tooltip;
 
 	void config(std::string name, std::vector<std::string> labels, bool momentary, TEnumFunc enumFunc, TToggleFunc toggleFunc, TModule* module) {
     	this->momentary = momentary;
-        for (int i = 0; i < num_labels; i++) {
+        for (size_t i = 0; i < num_labels; i++) {
             this->labels.push_back(labels[i]);
         }
         this->name = name;
         this->enumFunc = enumFunc;
         this->toggleFunc = toggleFunc;
 		this->module = module;
+		this->tooltip = NULL;
 	}
 
 	void setTooltip(ui::Tooltip* tooltip) {
@@ -174,7 +176,7 @@ struct WaterTableDisplay : TransparentWidget {
 	}
 
 
-	void drawWaveform(const DrawArgs& args, std::vector<float_4> &buffer, int index) {
+	void drawWaveform(const DrawArgs& args, std::vector<float_4> &buffer, int index, const NVGpaint& p, bool halo) {
 		float step = static_cast<float>(index) / static_cast<float>(HISTORY_SIZE-1);
 		nvgScissor(args.vg, b.pos.x, b.pos.y, b.size.x, b.size.y);
 		nvgBeginPath(args.vg);
@@ -235,7 +237,13 @@ struct WaterTableDisplay : TransparentWidget {
 
 		const float alpha_scale = 1.0;
 		float alpha = alpha_scale*simd::pow(step, 2.0);
-		nvgFillColor(args.vg, nvgTransRGBAf(gradient(0.0), alpha));
+		if (halo) {
+			nvgFillPaint(args.vg, p);
+			nvgAlpha(args.vg, 0.8);
+		} else {
+			nvgFillColor(args.vg, nvgTransRGBAf(orange_red, alpha));
+		}
+
 		nvgFill(args.vg);
 
 		nvgResetScissor(args.vg);
@@ -268,6 +276,26 @@ struct WaterTableDisplay : TransparentWidget {
 		min = (min.norm() < left.norm()) ? min : left;
 		min = (min.norm() < right.norm()) ? min : right;
 		return min;
+	}
+
+	void drawTextBoxHalo(const DrawArgs& args, Vec center) {
+		nvgGlobalCompositeOperation(args.vg, NVG_LIGHTER);
+		//const float width = 30.0;
+		//const float height = 10.0;
+		const float width = 45.0;
+		const float height = 25.0;
+		Vec half = Vec(width/2., height/2.);
+
+		Vec bot_l = center.plus(Vec(-half.x,-half.y));
+
+		nvgBeginPath(args.vg);
+		NVGpaint p = nvgBoxGradient(args.vg, bot_l.x, bot_l.y, width, height, 12.5, 35.0, 
+				nvgTransRGBAf(orange_red_bright, settings::haloBrightness), 
+				nvgTransRGBAf(orange_red_bright,-1.0f));
+		nvgRoundedRect(args.vg, bot_l.x, bot_l.y, width, height, 10.0);
+		nvgClosePath(args.vg);
+		nvgFillPaint(args.vg, p);
+		nvgFill(args.vg);
 	}
 
 	void drawTextBox(const DrawArgs& args, Vec pos_line, Vec center, const char* text) {
@@ -328,7 +356,9 @@ struct WaterTableDisplay : TransparentWidget {
 	}
 
 	void drawMarker(const DrawArgs& args, float pos, const char* text, bool left, bool up) {
-		// Draw line
+		Vec p = getMarkerStartFromPos(pos);
+		Vec n = getMarkerStartFromPos(pos, RADIUS*0.6);
+
 		nvgStrokeColor(args.vg, orange_red);
 		nvgLineCap(args.vg, NVG_SQUARE);
 		nvgStrokeWidth(args.vg, 1.0f);
@@ -337,11 +367,12 @@ struct WaterTableDisplay : TransparentWidget {
 		nvgFillColor(args.vg, orange_red_bright);
 		nvgGlobalCompositeOperation(args.vg, NVG_LIGHTER);
 		{
-			Vec p = getMarkerStartFromPos(pos);
-			Vec n = getMarkerStartFromPos(pos, RADIUS*0.6);
+			//Vec p = getMarkerStartFromPos(pos);
+			//Vec n = getMarkerStartFromPos(pos, RADIUS*0.6);
 			drawTextBox(args, p, n, text);
 		}
 		nvgStroke(args.vg);
+		drawTextBoxHalo(args, n);
 	}
 
 	float modRange(float pos, float width, float amp) {
@@ -375,6 +406,31 @@ struct WaterTableDisplay : TransparentWidget {
 		nvgStroke(args.vg);
 		nvgGlobalCompositeOperation(args.vg, NVG_LIGHTER);
 
+	}
+
+	void drawModelNameHalo(const DrawArgs& args) {
+		nvgGlobalCompositeOperation(args.vg, NVG_LIGHTER);
+		//const float width = 30.0;
+		//const float height = 10.0;
+		const float base_w = b.size.x;
+		const float base_h = 10.0;
+		const float edge = 7.5;
+		const float halo_w = base_w + 2.0 * edge;
+		const float halo_h = base_h + 2.0 * edge;
+
+		Vec t_box = b.size.minus(Vec(0,20));
+		Vec mid = Vec(base_w/2.0, base_h/2.0);
+		Vec center = Vec(0.0, t_box.y).plus(mid);
+		Vec bot_l = center.minus(mid.plus(Vec(edge, edge)));
+
+		nvgBeginPath(args.vg);
+		NVGpaint p = nvgBoxGradient(args.vg, bot_l.x, bot_l.y, halo_w, halo_h, 12.5, 35.0, 
+				nvgTransRGBAf(orange_red_bright, settings::haloBrightness), 
+				nvgTransRGBAf(orange_red_bright,-1.0f));
+		nvgRoundedRect(args.vg, bot_l.x, bot_l.y, halo_w , halo_h, 10.0);
+		nvgClosePath(args.vg);
+		nvgFillPaint(args.vg, p);
+		nvgFill(args.vg);
 	}
 
 	void drawModelName(const DrawArgs& args) {
@@ -432,36 +488,46 @@ struct WaterTableDisplay : TransparentWidget {
 		//nvgResetScissor(args.vg);
 	}
 
-	void draw(const DrawArgs& args) override {
+	void drawLayer(const DrawArgs& args, int layer) override {
 		if (!module)
 			return;
 
-		history.push_back(module->waveChannel.v_a0);
-		history.pop_front();
+		if (layer == 1) {
+			history.push_back(module->waveChannel.v_a0);
+			history.pop_front();
 
-		nvgBeginPath(args.vg);
-		nvgRoundedRect(args.vg, b.pos.x, b.pos.y, b.size.x, b.size.y, 10.0);
-		nvgFillColor(args.vg, dark_grey);
-		nvgFill(args.vg);
-		nvgClosePath(args.vg);
+			nvgSave(args.vg);
+				nvgGlobalCompositeOperation(args.vg, NVG_LIGHTER);
+				drawModelName(args);
+				drawModelNameHalo(args);
+			nvgRestore(args.vg);
 
-		nvgSave(args.vg);
-			nvgGlobalCompositeOperation(args.vg, NVG_LIGHTER);
-			drawModelName(args);
-		nvgRestore(args.vg);
+			nvgSave(args.vg);
+				nvgGlobalCompositeOperation(args.vg, NVG_LIGHTER);
+				Vec center = scaleToBoxByX(Vec(0.f,0.f));
+				Vec right = scaleToBoxByX(Vec(1.f,0.f));
+				NVGpaint p = nvgRadialGradient(args.vg, center.x, center.y, 0.0, right.x, orange_red_bright, nvgTransRGBAf(orange_red_bright, 0.0));
+				//for (auto v : history) {
+				//	drawWaveform(args, v, i, p, false);
+				//	i++;
+				//}
 
-		int i = 0;
-		nvgSave(args.vg);
-			nvgGlobalCompositeOperation(args.vg, NVG_LIGHTER);
-			for (auto v : history) {
-				drawWaveform(args, v, i);
-				i++;
-			}
-		nvgRestore(args.vg);
+				for (int i = history.size() - 1; i >= 0; i--) {
+					drawWaveform(args, history[i], i, p, true);
+				}
+			nvgRestore(args.vg);
 
-		nvgSave(args.vg);
-			drawMarkers(args);
-		nvgRestore(args.vg);
+			nvgSave(args.vg);
+				drawMarkers(args);
+			nvgRestore(args.vg);
+		} else {
+			nvgBeginPath(args.vg);
+			nvgRoundedRect(args.vg, b.pos.x, b.pos.y, b.size.x, b.size.y, 10.0);
+			nvgFillColor(args.vg, dark_grey);
+			nvgFill(args.vg);
+			nvgClosePath(args.vg);
+		}
 
+		Widget::drawLayer(args, layer);
 	}
 };
