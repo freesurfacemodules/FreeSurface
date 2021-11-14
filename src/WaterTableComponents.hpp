@@ -118,6 +118,7 @@ struct WaterTableDisplay : TransparentWidget {
 	const NVGcolor dark_grey = nvgRGBA(0x10, 0x10, 0x10, 0xff);
 	const int HISTORY_SIZE = 16;
 	std::deque<std::vector<float_4>> history;
+	float halo_brightness = 0.5;
 
 
 	NVGcolor gradient(float x) {
@@ -290,7 +291,7 @@ struct WaterTableDisplay : TransparentWidget {
 
 		nvgBeginPath(args.vg);
 		NVGpaint p = nvgBoxGradient(args.vg, bot_l.x, bot_l.y, width, height, 12.5, 35.0, 
-				nvgTransRGBAf(orange_red_bright, settings::haloBrightness), 
+				nvgTransRGBAf(orange_red_bright, halo_brightness), 
 				nvgTransRGBAf(orange_red_bright,-1.0f));
 		nvgRoundedRect(args.vg, bot_l.x, bot_l.y, width, height, 10.0);
 		nvgClosePath(args.vg);
@@ -425,7 +426,7 @@ struct WaterTableDisplay : TransparentWidget {
 
 		nvgBeginPath(args.vg);
 		NVGpaint p = nvgBoxGradient(args.vg, bot_l.x, bot_l.y, halo_w, halo_h, 12.5, 35.0, 
-				nvgTransRGBAf(orange_red_bright, settings::haloBrightness), 
+				nvgTransRGBAf(orange_red_bright, halo_brightness), 
 				nvgTransRGBAf(orange_red_bright,-1.0f));
 		nvgRoundedRect(args.vg, bot_l.x, bot_l.y, halo_w , halo_h, 10.0);
 		nvgClosePath(args.vg);
@@ -491,6 +492,8 @@ struct WaterTableDisplay : TransparentWidget {
 	void drawLayer(const DrawArgs& args, int layer) override {
 		if (!module)
 			return;
+
+		halo_brightness = sqrt(settings::haloBrightness);
 
 		if (layer == 1) {
 			history.push_back(module->waveChannel.v_a0);

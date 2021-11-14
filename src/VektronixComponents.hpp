@@ -53,8 +53,8 @@ struct VektronixPortBorderlessDark : app::SvgPort {
 
 struct VektronixBigKnob : app::SvgKnob {
 	VektronixBigKnob() {
-		minAngle = -0.82 * M_PI;
-		maxAngle = 0.82 * M_PI;
+		minAngle = -0.83 * M_PI;
+		maxAngle = 0.83 * M_PI;
 		setSvg(APP->window->loadSvg(asset::plugin(pluginInstance, "res/VektronixBigKnob.svg")));
 		// Add cap
 		widget::FramebufferWidget* capFb = new widget::FramebufferWidget;
@@ -126,6 +126,23 @@ struct VektronixIndicatorTinyDark : RotatingIndicator {
 	}
 };
 
+static float angleFromParamQuantity(ParamQuantity* paramQuantity, float scale, float minAngle, float maxAngle) {
+	float value = paramQuantity->getSmoothValue();
+	float angle;
+	if (!paramQuantity->isBounded()) {
+		// just map from -1..1, different from default behavior
+		angle = math::rescale(scale * paramQuantity->getValue(), -1.f, 1.f, minAngle, maxAngle);
+	}
+	else if (paramQuantity->getRange() == 0.f) {
+		// Center angle for zero range
+		angle = (minAngle + maxAngle) / 2.f;
+	} else {
+		// Proportional angle for finite range
+		angle = math::rescale(value, paramQuantity->getMinValue(), paramQuantity->getMaxValue(), minAngle, maxAngle);
+	}
+	return std::fmod(angle, 2 * M_PI);
+}
+
 struct VektronixInfiniteBigKnob : app::SvgKnob {
 	float scale = 1.0;
 	VektronixIndicatorDark* indicator;
@@ -148,14 +165,7 @@ struct VektronixInfiniteBigKnob : app::SvgKnob {
 		ParamQuantity* paramQuantity = getParamQuantity();
 		// Re-transform the widget::TransformWidget
 		if (paramQuantity) {
-			float angle;
-			if (paramQuantity->isBounded()) {
-				angle = math::rescale(paramQuantity->getScaledValue(), 0.f, 1.f, minAngle, maxAngle);
-			}
-			else {
-				angle = math::rescale(scale * paramQuantity->getValue(), -1.f, 1.f, minAngle, maxAngle);
-			}
-			angle = std::fmod(angle, 2 * M_PI);
+			float angle = angleFromParamQuantity(paramQuantity, scale, minAngle, maxAngle);
 			indicator->rotateFromParent(angle); // draw our little rotating indicator on top of the cap
 			tw->identity();
 			// Rotate SVG
@@ -199,8 +209,8 @@ struct VektronixBigKnobDark : app::SvgKnob {
 	float scale = 1.0;
 	VektronixIndicatorDark* indicator;
 	VektronixBigKnobDark() {
-		minAngle = -0.82*M_PI;
-		maxAngle = 0.82*M_PI;
+		minAngle = -0.83*M_PI;
+		maxAngle = 0.83*M_PI;
 		speed = 1.0;
 		setSvg(APP->window->loadSvg(asset::plugin(pluginInstance, "res/VektronixBigKnobDark.svg")));
 		// Add cap
@@ -214,17 +224,10 @@ struct VektronixBigKnobDark : app::SvgKnob {
 	}
 
 	void onChange(const event::Change& e) override {
+
 		ParamQuantity* paramQuantity = getParamQuantity();
-		// Re-transform the widget::TransformWidget
 		if (paramQuantity) {
-			float angle;
-			if (paramQuantity->isBounded()) {
-				angle = math::rescale(paramQuantity->getScaledValue(), 0.f, 1.f, minAngle, maxAngle);
-			}
-			else {
-				angle = math::rescale(scale * paramQuantity->getValue(), -1.f, 1.f, minAngle, maxAngle);
-			}
-			angle = std::fmod(angle, 2 * M_PI);
+			float angle = angleFromParamQuantity(paramQuantity, scale, minAngle, maxAngle);
 			indicator->rotateFromParent(angle); // draw our little rotating indicator on top of the cap
 			tw->identity();
 			// Rotate SVG
@@ -243,8 +246,8 @@ struct VektronixSmallKnobDark : app::SvgKnob {
 	float scale = 1.0;
 	VektronixIndicatorSmallDark* indicator;
 	VektronixSmallKnobDark() {
-		minAngle = -0.82 * M_PI;
-		maxAngle = 0.82 * M_PI;
+		minAngle = -0.83 * M_PI;
+		maxAngle = 0.83 * M_PI;
 		speed = 1.0;
 		setSvg(APP->window->loadSvg(asset::plugin(pluginInstance, "res/VektronixSmallKnobDark.svg")));
 		// Add cap
@@ -261,14 +264,7 @@ struct VektronixSmallKnobDark : app::SvgKnob {
 		ParamQuantity* paramQuantity = getParamQuantity();
 		// Re-transform the widget::TransformWidget
 		if (paramQuantity) {
-			float angle;
-			if (paramQuantity->isBounded()) {
-				angle = math::rescale(paramQuantity->getScaledValue(), 0.f, 1.f, minAngle, maxAngle);
-			}
-			else {
-				angle = math::rescale(scale * paramQuantity->getValue(), -1.f, 1.f, minAngle, maxAngle);
-			}
-			angle = std::fmod(angle, 2 * M_PI);
+			float angle = angleFromParamQuantity(paramQuantity, scale, minAngle, maxAngle);
 			indicator->rotateFromParent(angle); // draw our little rotating indicator on top of the cap
 			tw->identity();
 			// Rotate SVG
@@ -286,8 +282,8 @@ struct VektronixTinyKnobDark : app::SvgKnob {
 	float scale = 1.0;
 	VektronixIndicatorTinyDark* indicator;
 	VektronixTinyKnobDark() {
-		minAngle = -0.82 * M_PI;
-		maxAngle = 0.82 * M_PI;
+		minAngle = -0.83 * M_PI;
+		maxAngle = 0.83 * M_PI;
 		speed = 1.0;
 		setSvg(APP->window->loadSvg(asset::plugin(pluginInstance, "res/VektronixTinyKnobDark.svg")));
 		// Add cap
@@ -304,14 +300,7 @@ struct VektronixTinyKnobDark : app::SvgKnob {
 		ParamQuantity* paramQuantity = getParamQuantity();
 		// Re-transform the widget::TransformWidget
 		if (paramQuantity) {
-			float angle;
-			if (paramQuantity->isBounded()) {
-				angle = math::rescale(paramQuantity->getScaledValue(), 0.f, 1.f, minAngle, maxAngle);
-			}
-			else {
-				angle = math::rescale(scale * paramQuantity->getValue(), -1.f, 1.f, minAngle, maxAngle);
-			}
-			angle = std::fmod(angle, 2 * M_PI);
+			float angle = angleFromParamQuantity(paramQuantity, scale, minAngle, maxAngle);
 			indicator->rotateFromParent(angle); // draw our little rotating indicator on top of the cap
 			tw->identity();
 			// Rotate SVG
@@ -327,8 +316,8 @@ struct VektronixTinyKnobDark : app::SvgKnob {
 
 struct VektronixSmallKnob : app::SvgKnob {
 	VektronixSmallKnob() {
-		minAngle = -0.82 * M_PI;
-		maxAngle = 0.82 * M_PI;
+		minAngle = -0.83 * M_PI;
+		maxAngle = 0.83 * M_PI;
 		setSvg(APP->window->loadSvg(asset::plugin(pluginInstance, "res/VektronixSmallKnob.svg")));
 		// Add cap
 		widget::FramebufferWidget* capFb = new widget::FramebufferWidget;
