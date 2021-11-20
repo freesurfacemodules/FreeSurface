@@ -18,10 +18,12 @@ jobs:
           - name: Linux
             sdk: lin
             os: ubuntu-latest
+            update-apt: sudo apt-get update -y
             prepare-os: sudo apt install -y libglu-dev
           - name: MacOS
             sdk: mac
             os: macos-latest
+            update-apt: ""
             prepare-os: ""
     steps:
       - uses: actions/checkout@v2
@@ -42,6 +44,7 @@ jobs:
           cat <<< `jq --arg VERSION "$pluginversion-$gitrev" '.version=$VERSION' plugin.json` > plugin.json
       - name: Build plugin
         run: |
+          ${{ matrix.config.update-apt }}
           ${{ matrix.config.prepare-os }}
           export RACK_DIR=$HOME/Rack-SDK
           make -j dep
