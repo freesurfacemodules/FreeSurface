@@ -106,19 +106,23 @@ struct FreeSurfaceLogoToggleDark : NamedEnumToggle<EnumFunc, ToggleFunc, TModule
 template <class TModule, size_t CHANNEL_SIZE, size_t CHANNEL_SIZE_FLOATS>
 struct WaterTableDisplay : TransparentWidget {
 	TModule* module;
+
 	const float RADIUS = 0.8;
 	const float MOD_RING_R = 0.5;
 	const float Y_OFFSET = -6.0;
-	Rect b;
-	std::shared_ptr<Font> font;
 	const NVGcolor orange_red_bright = nvgRGBA(0xf5, 0x39, 0x0a, 0xff);
 	const NVGcolor orange_red = nvgRGBA(0xd0, 0x28, 0x0a, 0xff);
 	const NVGcolor ember_orange = nvgRGBA(0xff, 0xcf, 0x3f, 0xff);
 	const NVGcolor hot_white = nvgRGBA(0xff, 0xff, 0xeb, 0xff);
 	const NVGcolor dark_grey = nvgRGBA(0x10, 0x10, 0x10, 0xff);
+
+	float halo_brightness = 0.5;
+	Rect b;
+	
 	const int HISTORY_SIZE = 16;
 	std::deque<std::vector<float_4>> history;
-	float halo_brightness = 0.5;
+	std::string fontPath;
+
 
 
 	NVGcolor gradient(float x) {
@@ -128,10 +132,9 @@ struct WaterTableDisplay : TransparentWidget {
 			x);
 	}
 
-	WaterTableDisplay() : history(HISTORY_SIZE,
-    		std::vector<float_4>(CHANNEL_SIZE, float_4::zero())) {
-		font = APP->window->loadFont(asset::plugin(pluginInstance, "res/fixedsys-excelsior-301.ttf"));
-	}
+	WaterTableDisplay() : 
+			history(HISTORY_SIZE, std::vector<float_4>(CHANNEL_SIZE, float_4::zero())),
+			fontPath(asset::plugin(pluginInstance, "res/fixedsys-excelsior-301.ttf")) {}
 
 	void setBBox() {
 		b = Rect(Vec(0, 0), box.size);
@@ -356,7 +359,7 @@ struct WaterTableDisplay : TransparentWidget {
 		nvgGlobalCompositeOperation(args.vg, NVG_LIGHTER);
 	}
 
-	void drawMarker(const DrawArgs& args, float pos, const char* text, bool left, bool up) {
+	void drawMarker(const DrawArgs& args, float pos, const char* text, bool left, bool up, std::shared_ptr<Font> font) {
 		Vec p = getMarkerStartFromPos(pos);
 		Vec n = getMarkerStartFromPos(pos, RADIUS*0.6);
 
@@ -434,7 +437,7 @@ struct WaterTableDisplay : TransparentWidget {
 		nvgFill(args.vg);
 	}
 
-	void drawModelName(const DrawArgs& args) {
+	void drawModelName(const DrawArgs& args, std::shared_ptr<Font> font) {
 		Vec t_box = b.size.minus(Vec(0,20));
 		Vec mid = Vec(b.size.x/2.0, 0.0);
 		Vec p = t_box.plus(Vec(mid.x,8.0)).minus(Vec(b.size.x,0));
@@ -463,7 +466,7 @@ struct WaterTableDisplay : TransparentWidget {
 
 	}
 
-	void drawMarkers(const DrawArgs& args) {
+	void drawMarkers(const DrawArgs& args, std::shared_ptr<Font> font) {
 		float pos_in_L = module->pos_in_L_param.getValue();
 		float pos_in_R = module->pos_in_R_param.getValue();
 		float pos_out_L = module->pos_out_L_param.getValue();
@@ -475,21 +478,24 @@ struct WaterTableDisplay : TransparentWidget {
 		const char* R_IN = "R_IN";
 		const char* L_OUT = "L_OUT";
 		const char* R_OUT = "R_OUT";
-		drawMarker(args, pos_in_L, L_IN, true, true);
+		drawMarker(args, pos_in_L, L_IN, true, true, font);
 		if (module->waveChannel.isModMode()) {
 			float amp_in_R = module->waveChannel.amp_in_R;
 			float sig_in_R = module->sig_in_R_param.getValue();
 			drawModInfo(args, pos_in_R, sig_in_R, amp_in_R);
 		} else {
-			drawMarker(args, pos_in_R, R_IN, false, true);
+			drawMarker(args, pos_in_R, R_IN, false, true, font);
 		}		
-		drawMarker(args, pos_out_L, L_OUT, true, false);
-		drawMarker(args, pos_out_R, R_OUT, false, false);
+		drawMarker(args, pos_out_L, L_OUT, true, false, font);
+		drawMarker(args, pos_out_R, R_OUT, false, false, font);
 
 		//nvgResetScissor(args.vg);
 	}
 
 	void drawLayer(const DrawArgs& args, int layer) override {
+		// get font each draw, fix for Rack in VST context
+		std::shared_ptr<Font> font = APP->window->loadFont(fontPath);
+
 		if (!module)
 			return;
 
@@ -501,7 +507,7 @@ struct WaterTableDisplay : TransparentWidget {
 
 			nvgSave(args.vg);
 				nvgGlobalCompositeOperation(args.vg, NVG_LIGHTER);
-				drawModelName(args);
+				drawModelName(args, font);
 				drawModelNameHalo(args);
 			nvgRestore(args.vg);
 
@@ -521,7 +527,7 @@ struct WaterTableDisplay : TransparentWidget {
 			nvgRestore(args.vg);
 
 			nvgSave(args.vg);
-				drawMarkers(args);
+				drawMarkers(args, font);
 			nvgRestore(args.vg);
 		} else {
 			nvgBeginPath(args.vg);
