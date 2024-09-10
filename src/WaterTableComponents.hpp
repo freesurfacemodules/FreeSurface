@@ -16,7 +16,7 @@ using simd::int32_4;
 typedef std::function<int()> EnumFunc;
 typedef std::function<void()> ToggleFunc;
 
-template<typename TEnumFunc, typename TToggleFunc, class TModule, uint num_labels>
+template<typename TEnumFunc, typename TToggleFunc, class TModule, unsigned int num_labels>
 struct NamedEnumToggle : SvgSwitch {
 	TModule* module;
     std::vector<std::string> labels;
@@ -27,7 +27,7 @@ struct NamedEnumToggle : SvgSwitch {
 
 	void config(std::string name, std::vector<std::string> labels, bool momentary, TEnumFunc enumFunc, TToggleFunc toggleFunc, TModule* module) {
     	this->momentary = momentary;
-        for (uint i = 0; i < num_labels; i++) {
+        for (unsigned int i = 0; i < num_labels; i++) {
             this->labels.push_back(labels[i]);
         }
         this->name = name;
@@ -85,7 +85,7 @@ struct NamedEnumToggle : SvgSwitch {
 	}
 };
 
-template <typename TModule, size_t num_labels>
+template <typename TModule, unsigned int num_labels>
 struct RoundToggleDark : NamedEnumToggle<EnumFunc, ToggleFunc, TModule, num_labels> {
 	RoundToggleDark() {
 		SvgSwitch::addFrame(APP->window->loadSvg(asset::plugin(pluginInstance, "res/VektronixRoundButtonUpDark.svg")));
@@ -94,7 +94,7 @@ struct RoundToggleDark : NamedEnumToggle<EnumFunc, ToggleFunc, TModule, num_labe
 	}
 };
 
-template <typename TModule, size_t num_labels>
+template <typename TModule, unsigned int num_labels>
 struct FreeSurfaceLogoToggleDark : NamedEnumToggle<EnumFunc, ToggleFunc, TModule, num_labels> {
 	FreeSurfaceLogoToggleDark() {
 		SvgSwitch::addFrame(APP->window->loadSvg(asset::plugin(pluginInstance, "res/FreeSurfaceLogoButtonUpDark.svg")));
