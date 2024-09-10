@@ -1061,10 +1061,10 @@ struct WaterTable : Module {
 		input_gain_R_param.configExp(this, MIN_GAIN , MAX_GAIN, DEF_GAIN, "input_gain_R", "Input Gain R");
 		dry_param.configExp(this, MIN_GAIN , MAX_GAIN, MIN_GAIN , "dry", "Dry Gain");
 		wet_param.configExp(this, MIN_GAIN , MAX_GAIN, DEF_GAIN, "wet", "Wet Gain");
-		configOutput(PROBE_OUT_L_OUTPUT, "Left output");
-		configOutput(PROBE_OUT_R_OUTPUT, "Right output");
-		configInput(PROBE_IN_L_INPUT, "Left input");
-		configInput(PROBE_IN_R_INPUT, "Right input");
+		configOutput(PROBE_OUT_L_OUTPUT, "Left");
+		configOutput(PROBE_OUT_R_OUTPUT, "Right");
+		configInput(PROBE_IN_L_INPUT, "Left");
+		configInput(PROBE_IN_R_INPUT, "Right");
 		lightDivider.setDivision(16);
 	}
 

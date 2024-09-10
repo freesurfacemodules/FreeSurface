@@ -127,7 +127,7 @@ struct VektronixIndicatorTinyDark : RotatingIndicator {
 };
 
 static float angleFromParamQuantity(ParamQuantity* paramQuantity, float scale, float minAngle, float maxAngle) {
-	float value = paramQuantity->getSmoothValue();
+	float value = paramQuantity->getValue();
 	float angle;
 	if (!paramQuantity->isBounded()) {
 		// just map from -1..1, different from default behavior
@@ -202,7 +202,6 @@ struct VektronixInfiniteBigKnob : app::SvgKnob {
 			}
 		}
 	}
-
 };
 
 struct VektronixBigKnobDark : app::SvgKnob {

@@ -16,7 +16,7 @@ using simd::int32_4;
 typedef std::function<int()> EnumFunc;
 typedef std::function<void()> ToggleFunc;
 
-template<typename TEnumFunc, typename TToggleFunc, class TModule, size_t num_labels>
+template<typename TEnumFunc, typename TToggleFunc, class TModule, uint num_labels>
 struct NamedEnumToggle : SvgSwitch {
 	TModule* module;
     std::vector<std::string> labels;
@@ -27,7 +27,7 @@ struct NamedEnumToggle : SvgSwitch {
 
 	void config(std::string name, std::vector<std::string> labels, bool momentary, TEnumFunc enumFunc, TToggleFunc toggleFunc, TModule* module) {
     	this->momentary = momentary;
-        for (size_t i = 0; i < num_labels; i++) {
+        for (uint i = 0; i < num_labels; i++) {
             this->labels.push_back(labels[i]);
         }
         this->name = name;
@@ -110,6 +110,8 @@ struct WaterTableDisplay : TransparentWidget {
 	const float RADIUS = 0.8;
 	const float MOD_RING_R = 0.5;
 	const float Y_OFFSET = -6.0;
+	Rect b;
+	std::shared_ptr<Font> font;
 	const NVGcolor orange_red_bright = nvgRGBA(0xf5, 0x39, 0x0a, 0xff);
 	const NVGcolor orange_red = nvgRGBA(0xd0, 0x28, 0x0a, 0xff);
 	const NVGcolor ember_orange = nvgRGBA(0xff, 0xcf, 0x3f, 0xff);
@@ -117,8 +119,7 @@ struct WaterTableDisplay : TransparentWidget {
 	const NVGcolor dark_grey = nvgRGBA(0x10, 0x10, 0x10, 0xff);
 
 	float halo_brightness = 0.5;
-	Rect b;
-	
+
 	const int HISTORY_SIZE = 16;
 	std::deque<std::vector<float_4>> history;
 	std::string fontPath;
@@ -132,7 +133,7 @@ struct WaterTableDisplay : TransparentWidget {
 			x);
 	}
 
-	WaterTableDisplay() : 
+	WaterTableDisplay() :
 			history(HISTORY_SIZE, std::vector<float_4>(CHANNEL_SIZE, float_4::zero())),
 			fontPath(asset::plugin(pluginInstance, "res/fixedsys-excelsior-301.ttf")) {}
 
@@ -293,8 +294,8 @@ struct WaterTableDisplay : TransparentWidget {
 		Vec bot_l = center.plus(Vec(-half.x,-half.y));
 
 		nvgBeginPath(args.vg);
-		NVGpaint p = nvgBoxGradient(args.vg, bot_l.x, bot_l.y, width, height, 12.5, 35.0, 
-				nvgTransRGBAf(orange_red_bright, halo_brightness), 
+		NVGpaint p = nvgBoxGradient(args.vg, bot_l.x, bot_l.y, width, height, 12.5, 35.0,
+				nvgTransRGBAf(orange_red_bright, halo_brightness),
 				nvgTransRGBAf(orange_red_bright,-1.0f));
 		nvgRoundedRect(args.vg, bot_l.x, bot_l.y, width, height, 10.0);
 		nvgClosePath(args.vg);
@@ -428,8 +429,8 @@ struct WaterTableDisplay : TransparentWidget {
 		Vec bot_l = center.minus(mid.plus(Vec(edge, edge)));
 
 		nvgBeginPath(args.vg);
-		NVGpaint p = nvgBoxGradient(args.vg, bot_l.x, bot_l.y, halo_w, halo_h, 12.5, 35.0, 
-				nvgTransRGBAf(orange_red_bright, halo_brightness), 
+		NVGpaint p = nvgBoxGradient(args.vg, bot_l.x, bot_l.y, halo_w, halo_h, 12.5, 35.0,
+				nvgTransRGBAf(orange_red_bright, halo_brightness),
 				nvgTransRGBAf(orange_red_bright,-1.0f));
 		nvgRoundedRect(args.vg, bot_l.x, bot_l.y, halo_w , halo_h, 10.0);
 		nvgClosePath(args.vg);
