@@ -2,7 +2,7 @@ name: Build VCV Rack Plugin
 on: [push, pull_request]
 
 env:
-  rack-sdk-version: 2.beta.1
+  rack-sdk-version: 2.2.0
 
 defaults:
   run:
@@ -16,12 +16,12 @@ jobs:
       matrix:
         config:
           - name: Linux
-            sdk: lin
+            sdk: lin-x64
             os: ubuntu-latest
             update-apt: sudo apt-get update -y
             prepare-os: sudo apt install -y libglu-dev
           - name: MacOS
-            sdk: mac
+            sdk: mac-x64
             os: macos-latest
             update-apt: ""
             prepare-os: ""
@@ -62,7 +62,7 @@ jobs:
       matrix:
         config:
           - name: Windows
-            sdk: win
+            sdk: win-x64
             needs-msys: true
             os: windows-latest
             prepare-os: export CC=gcc
