@@ -121,7 +121,7 @@ struct Vektronix : Module {
     // file selection dialog, based on PLAYERItem in cf
     // https://github.com/cfoulc/cf/blob/master/src/PLAYER.cpp
     void getSvgPathDialog() {
-        std::string dir = lastLoadedPath.empty() ? asset::user("") : rack::string::directory(lastLoadedPath);
+        std::string dir = lastLoadedPath.empty() ? asset::user("") : rack::system::getDirectory(lastLoadedPath);
         osdialog_filters* filters = osdialog_filters_parse(".svg files:svg");
         char *path = osdialog_file(OSDIALOG_OPEN, dir.c_str(), NULL, filters);
         if(path) {

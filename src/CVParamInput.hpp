@@ -14,9 +14,11 @@ using simd::int32_4;
 template <size_t PARAM, size_t INPUT_CV, size_t PARAM_CV>
 struct CVParamInput {
 	Module* module;
+
 	std::string json_label;
 	float min;
 	float max;
+	float def;
 	float shift; // for pitch conversion where the tone generator needs to be tuned
 	float sample_rate_scale; // also for pitch conversion
     float post_scale; // used to correct timestep range after the fact without fixing the tuning shift
@@ -24,6 +26,7 @@ struct CVParamInput {
 		Default,
 		Modulo,
 		Exponential,
+		Bipolar_Exponential,
 		Pitch 
 	} paramType;
 
@@ -32,51 +35,65 @@ struct CVParamInput {
 	bool dirty = true;
 	CVParamInput() {}
 
-	void config(Module* module, float min, float max, float def, std::string json_label, std::string label = "", std::string unit = "", float displayBase = 0.f, float displayMultiplier = 1.f, float displayOffset = 0.f) {
-		module->configParam(PARAM, min, max, def, label, unit, displayBase, displayMultiplier, displayOffset);
+	void configCVInput(std::string label) {
 		if (PARAM_CV != DUMMY_CV) {
 			module->configParam(PARAM_CV, -1.0, 1.0, 0.0, label + " CV");
 		}
-		this->json_label = json_label;
+		module->configInput(INPUT_CV, label);
+	}
+
+	void config(Module* module, float min, float max, float def, std::string json_label, std::string label = "", std::string unit = "", float displayBase = 0.f, float displayMultiplier = 1.f, float displayOffset = 0.f) {
 		this->module = module;
+		module->configParam(PARAM, min, max, def, label, unit, displayBase, displayMultiplier, displayOffset);
+		configCVInput(label);
+		this->json_label = json_label;
 		this->min = min;
 		this->max = max;
+		this->def = def;
 		this->paramType = ParamType::Default;
 	}
 
 	void configModulo(Module* module, float max, float def, std::string json_label, std::string label = "", std::string unit = "", float displayBase = 0.f, float displayMultiplier = 1.f, float displayOffset = 0.f) {
-		module->configParam(PARAM, -HUGE_VALF, HUGE_VALF, def, label, unit, displayBase, displayMultiplier, displayOffset);
-		if (PARAM_CV != DUMMY_CV) {
-			module->configParam(PARAM_CV, -1.0, 1.0, 0.0, label + " CV");
-		}
-		this->json_label = json_label;
 		this->module = module;
+		module->configParam(PARAM, -HUGE_VALF, HUGE_VALF, def, label, unit, displayBase, displayMultiplier, displayOffset);
+		configCVInput(label);
+		this->json_label = json_label;
 		this->min = 0.0;
 		this->max = max;
+		this->def = def;
 		this->paramType = ParamType::Modulo;
 	}
 
 	void configExp(Module* module, float min, float max, float def, std::string json_label, std::string label = "", std::string unit = "", float displayBase = 0.f, float displayMultiplier = 1.f, float displayOffset = 0.f) {
-		module->configParam(PARAM, min, max, def, label, unit, displayBase, displayMultiplier, displayOffset);
-		if (PARAM_CV != DUMMY_CV) {
-			module->configParam(PARAM_CV, -1.0, 1.0, 0.0, label + " CV");
-		}
-		this->json_label = json_label;
 		this->module = module;
+		module->configParam(PARAM, min, max, def, label, unit, displayBase, displayMultiplier, displayOffset);
+		configCVInput(label);
+		this->json_label = json_label;
 		this->min = min;
 		this->max = max;
+		this->def = def;
 		this->paramType = ParamType::Exponential;
 	}
 
-	void configPitch(Module* module, float post_scale, float sample_rate_scale, float shift, float param_min, float param_max, float val_max, float def, std::string json_label, std::string label = "", std::string unit = "", float displayBase = 0.f, float displayMultiplier = 1.f, float displayOffset = 0.f) {
-		module->configParam(PARAM, param_min, param_max, def, label, unit, displayBase, displayMultiplier, displayOffset);
-		if (PARAM_CV != DUMMY_CV) {
-			module->configParam(PARAM_CV, -1.0, 1.0, 0.0, label + " CV");
-		}
-		this->json_label = json_label;
+	void configBipolarExp(Module* module, float min, float max, float def, std::string json_label, std::string label = "", std::string unit = "", float displayBase = 0.f, float displayMultiplier = 1.f, float displayOffset = 0.f) {
 		this->module = module;
+		module->configParam(PARAM, min, max, def, label, unit, displayBase, displayMultiplier, displayOffset);
+		configCVInput(label);
+		this->json_label = json_label;
+		this->min = min;
+		this->max = max;
+		this->def = def;
+		this->paramType = ParamType::Bipolar_Exponential;
+	}
+
+	void configPitch(Module* module, float post_scale, float sample_rate_scale, float shift, float param_min, float param_max, float val_max, float def, std::string json_label, std::string label = "", std::string unit = "", float displayBase = 0.f, float displayMultiplier = 1.f, float displayOffset = 0.f) {
+		this->module = module;
+		module->configParam(PARAM, param_min, param_max, def, label, unit, displayBase, displayMultiplier, displayOffset);
+		configCVInput(label);
+		this->json_label = json_label;
 		this->min = 0.0;
 		this->max = val_max;
+		this->def = def;
 		this->shift = shift;
 		this->sample_rate_scale = sample_rate_scale;
         this->post_scale = post_scale;
@@ -95,6 +112,27 @@ struct CVParamInput {
 			paramCacheIn = gain;
 			//res = simd::rescale(std::pow(2.0, gain * 8.f), 0.00390625, 256.0, min, max); // scale from (2^-8, 2^8) to (min, max)
 			res = simd::rescale(std::pow(2.0, gain * 4.f), 0.0625, 16.0, min, max); // scale from (2^-4, 2^4) to (min, max)
+			paramCacheOut = res;
+		}
+
+		return paramCacheOut;
+	}
+
+	float getBipolarExpValue(float cv, float param, float input) {
+		// Get gain
+		float gain_param = simd::rescale(param, min, max, -1.0, 1.0);
+
+		float gain = simd::clamp(gain_param + cv * input, -1.0, 1.0);
+		
+		float res;
+		if (dirty || paramCacheIn != gain) {
+			dirty = false;
+			paramCacheIn = gain;
+			const float S = 8.0f;
+			float base = 1.0 / std::pow(2.0, S);
+			float expn = std::pow(2.0, std::abs(S*gain));
+			float curve = math::sgn(gain) * ((expn * base) - base) * (1.0f / (1.0f - base));
+			res = simd::rescale(curve, -1.0, 1.0, min, max);
 			paramCacheOut = res;
 		}
 
@@ -135,6 +173,9 @@ struct CVParamInput {
 			case Exponential:
 				return getExpValue(cv, param, input);
 				break;
+			case Bipolar_Exponential:
+				return getBipolarExpValue(cv, param, input);
+				break;
 			case Pitch:
 				return getPitchValue(cv, param, input);
 				break;
@@ -156,6 +197,15 @@ struct CVParamInput {
 		this->sample_rate_scale = sample_rate_scale;
 
 		dirty = true;
+	}
+
+	void reset() {
+		module->params[PARAM].setValue(def);
+	}
+
+	void randomize() {
+		float rand = simd::rescale(random::uniform(), 0.0, 1.0, min, max);
+		module->params[PARAM].setValue(rand);
 	}
 
 	void dataToJson(json_t* rootJ) {

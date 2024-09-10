@@ -2,7 +2,7 @@ name: Build VCV Rack Plugin
 on: [push, pull_request]
 
 env:
-  rack-sdk-version: 1.1.6
+  rack-sdk-version: 2.beta.1
 
 defaults:
   run:
@@ -16,10 +16,14 @@ jobs:
       matrix:
         config:
           - name: Linux
+            sdk: lin
             os: ubuntu-latest
+            update-apt: sudo apt-get update -y
             prepare-os: sudo apt install -y libglu-dev
           - name: MacOS
+            sdk: mac
             os: macos-latest
+            update-apt: ""
             prepare-os: ""
     steps:
       - uses: actions/checkout@v2
@@ -28,7 +32,7 @@ jobs:
       - name: Get Rack-SDK
         run: |
           pushd $HOME
-          curl -o Rack-SDK.zip https://vcvrack.com/downloads/Rack-SDK-${{ env.rack-sdk-version }}.zip
+          curl -o Rack-SDK.zip https://vcvrack.com/downloads/Rack-SDK-${{ env.rack-sdk-version }}-${{ matrix.config.sdk }}.zip
           unzip Rack-SDK.zip
       - name: Modify plugin version
         # only modify plugin version if no tag was created
@@ -40,6 +44,7 @@ jobs:
           cat <<< `jq --arg VERSION "$pluginversion-$gitrev" '.version=$VERSION' plugin.json` > plugin.json
       - name: Build plugin
         run: |
+          ${{ matrix.config.update-apt }}
           ${{ matrix.config.prepare-os }}
           export RACK_DIR=$HOME/Rack-SDK
           make -j dep
@@ -57,6 +62,7 @@ jobs:
       matrix:
         config:
           - name: Windows
+            sdk: win
             needs-msys: true
             os: windows-latest
             prepare-os: export CC=gcc
@@ -79,7 +85,7 @@ jobs:
         shell: msys2 {0}
         run: |
           pushd $HOME
-          curl -o Rack-SDK.zip https://vcvrack.com/downloads/Rack-SDK-${{ env.rack-sdk-version }}.zip
+          curl -o Rack-SDK.zip https://vcvrack.com/downloads/Rack-SDK-${{ env.rack-sdk-version }}-${{ matrix.config.sdk }}.zip
           unzip Rack-SDK.zip
       - name: Modify plugin version
         # only modify plugin version if no tag was created
@@ -128,7 +134,7 @@ jobs:
           tag_name: ${{ github.ref }}
           release_name: Release ${{ github.ref }}
           body: |
-            ${{ env.GITHUB_REPOSITORY_NAME }} VCV Rack Plugin ${{ env.GITHUB_REF_NAME }}
+            ${{ env.GITHUB_REPOSITORY_NAME }} VCV Rack 2 Plugin ${{ env.GITHUB_REF_NAME }}
           draft: false
           prerelease: false
       - uses: actions/download-artifact@v2
@@ -138,6 +144,6 @@ jobs:
         uses: svenstaro/upload-release-action@v2
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: _artifacts/**/*.zip
+          file: _artifacts/**/*.vcvplugin
           tag: ${{ github.ref }}
           file_glob: true

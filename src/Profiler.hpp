@@ -27,7 +27,7 @@ struct ProfilerDaemon {
     void log() {
         for (int i = 0; i < NUM_MARKERS; i++) {
             double avg = calls[i] > 0 ? elapsed[i] / calls[i] : 0.0;
-            DEBUG("Marker %d called %d times, average call time %f ns", i, calls[i], avg);
+            DEBUG("Marker %d called %lu times, average call time %f ns", i, calls[i], avg);
         }
     }
 } profilerDaemon;

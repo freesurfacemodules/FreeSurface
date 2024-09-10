@@ -39,10 +39,37 @@ struct WaveChannel {
 		SINC
 	};
 
+	enum OversamplingMode {
+		OVERSAMPLE_SINC,
+		OVERSAMPLE_BIQUAD
+	};
+
+	enum ClipRange {
+		V_10,
+		V_30,
+		V_60,
+		V_100
+	};
+
+	OversamplingMode oversampling_mode = OversamplingMode::OVERSAMPLE_BIQUAD;
+
+	float clip_range = 30.0f;
+	ClipRange clip_range_mode = ClipRange::V_30;
+
 	dsp::BiquadFilter biquad_output_L;
 	dsp::BiquadFilter biquad_output_R;
 	dsp::BiquadFilter biquad_input_L;
 	dsp::BiquadFilter biquad_input_R;
+
+	dsp::Decimator<4, 4> decimator_output_L;
+	dsp::Decimator<4, 4> decimator_output_R;
+	dsp::Upsampler<4, 4> upsampler_input_L;
+	dsp::Upsampler<4, 4> upsampler_input_R;
+
+	float upsampler_result_input_L[4] = {0};
+	float upsampler_result_input_R[4] = {0};
+	float decimator_input_L[4] = {0};
+	float decimator_input_R[4] = {0};
         
 
 	/** Member function pointer for the current model.
@@ -102,7 +129,8 @@ struct WaveChannel {
 	WaveChannel() {
 		model = Model::WAVE_EQUATION;
 		modelPointer = &WaveChannel::stepWaveEquation;
-		const float biquad_cutoff = 0.125f;
+		//const float biquad_cutoff = 0.125f;
+		const float biquad_cutoff = 0.0625f;
 		const float biquad_Q = 0.5f;
 		const float biquad_gain = 1.0f;
 		biquad_input_L.setParameters(dsp::BiquadFilter::Type::LOWPASS,  biquad_cutoff, biquad_Q, biquad_gain);
@@ -294,8 +322,8 @@ struct WaveChannel {
 	std::vector<float_4> b_half_4 = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
 	std::vector<float_4> b_grad_4 = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
 
-	#define I_CLAMP 30.0
-	#define F_CLAMP 30.0
+	#define I_CLAMP clip_range
+	#define F_CLAMP clip_range
 	#define INTER_CLAMP(x) smoothclamp((x),-I_CLAMP,I_CLAMP)
 	#define FINAL_CLAMP(x) smoothclamp((x),-F_CLAMP,F_CLAMP)
 
@@ -303,17 +331,25 @@ struct WaveChannel {
 	float t_amp_in_prev_R = 0.0f;
 	
 	
-	inline void processInputSample(float &input_L, float &input_R, const float &feedback_amp_L, const float &feedback_amp_R) {
-		float t_amp_in_L = biquad_input_L.process(input_L);
-		float t_amp_in_R = biquad_input_R.process(input_R);
-		//input_L = feedback * INTER_CLAMP(0.25*feedback_amp_L) + t_amp_in_L;
-		//input_R = feedback * INTER_CLAMP(0.25*feedback_amp_R) + t_amp_in_R;
+	inline void processInputSample(float &input_L, float &input_R, const float &feedback_amp_L, const float &feedback_amp_R, int iter) {
+		float t_amp_in_L, t_amp_in_R;
+		if (oversampling_mode == OversamplingMode::OVERSAMPLE_SINC) {
+			if (iter == 0) {
+				upsampler_input_L.process(input_L, upsampler_result_input_L);
+				upsampler_input_R.process(input_R, upsampler_result_input_R);
+			}
+			t_amp_in_L = upsampler_result_input_L[iter];
+			t_amp_in_R = upsampler_result_input_R[iter];
+		} else {
+			t_amp_in_L = biquad_input_L.process(input_L);
+			t_amp_in_R = biquad_input_R.process(input_R);
+		}
 
 		// no really special reason for this, but squid axon rapidly squashes
 		// inputs, so it can take more feedback
 		if (model == WaveChannel::SQUID_AXON) {
-			input_L = feedback * feedback_amp_L + t_amp_in_L;
-			input_R = feedback * feedback_amp_R + t_amp_in_R;
+			input_L = feedback * 4.0 * INTER_CLAMP(0.25 * feedback_amp_L) + t_amp_in_L;
+			input_R = feedback * 4.0 * INTER_CLAMP(0.25 * feedback_amp_R) + t_amp_in_R;
 		} else {
 			input_L = feedback * INTER_CLAMP(0.25 * feedback_amp_L) + t_amp_in_L;
 			input_R = feedback * INTER_CLAMP(0.25 * feedback_amp_R) + t_amp_in_R;
@@ -327,18 +363,24 @@ struct WaveChannel {
 		input_R = biquad_input_R.process(feedback * INTER_CLAMP(feedback_amp_R) + input_R);
 	}*/
 
-	inline void processOutputSample(float &sample_L, float &sample_R) {
-		sample_L = biquad_output_L.process(sample_L);
-		sample_R = biquad_output_R.process(sample_R);
+	inline void processOutputSample(float &sample_L, float &sample_R, int iter) {
+		if (oversampling_mode == OversamplingMode::OVERSAMPLE_SINC) {
+			decimator_input_L[iter] = sample_L;
+			decimator_input_R[iter] = sample_R;
+		} else {
+			sample_L = biquad_output_L.process(sample_L);
+			sample_R = biquad_output_R.process(sample_R);
+		}
 	}
 
 	inline void modelIteration(
 			const std::vector<float_4> &a_in, std::vector<float_4> &delta_a,
 			const std::vector<float_4> &b_in, std::vector<float_4> &delta_b,
 			float input_L, float input_R, 
-			float &t_amp_out_L, float &t_amp_out_R) {
+			float &t_amp_out_L, float &t_amp_out_R,
+			int iter) {
 
-		processInputSample(input_L, input_R, t_amp_out_L, t_amp_out_R);
+		processInputSample(input_L, input_R, t_amp_out_L, t_amp_out_R, iter);
 
 		gradient_and_laplacian(a_in, t_gradient_a, t_laplacian_a);
 		gradient_and_laplacian(b_in, t_gradient_b, t_laplacian_b);
@@ -346,7 +388,7 @@ struct WaveChannel {
 		t_gradient_a, t_gradient_b, delta_a, delta_b, v_dc_a, v_dc_b,
 		input_L, input_R, t_amp_out_L, t_amp_out_R);
 
-		processOutputSample(t_amp_out_L, t_amp_out_R);
+		processOutputSample(t_amp_out_L, t_amp_out_R, iter);
 	}
 
 	/** Runge-Kutta (RK4) integration,
@@ -361,7 +403,10 @@ struct WaveChannel {
 		const float third = 1.0/3.0;
 
 		// Round 1, initial step
-		modelIteration( a0, a_grad_1, b0, b_grad_1, amp_in_L - low_cut * amp_in_prev_L, amp_in_R - low_cut * amp_in_prev_R, amp_out_L, amp_out_R);
+		modelIteration( a0, a_grad_1, b0, b_grad_1, 
+				amp_in_L - low_cut * amp_in_prev_L, 
+				amp_in_R - low_cut * amp_in_prev_R, 
+				amp_out_L, amp_out_R, 0);
 
 		for (int i = 0; i < CHANNEL_SIZE; i++) {
 			INTER_CLAMP(a_half_2[i] = a0[i] + third * timestep * a_grad_1[i]);
@@ -370,7 +415,7 @@ struct WaveChannel {
 
 		// Round 2, 1/3 step
 		// input is only non-zero on the first round for upsampling		
-		modelIteration( a_half_2, a_grad_2, b_half_2, b_grad_2, 0.f, 0.f, amp_out_L, amp_out_R);
+		modelIteration( a_half_2, a_grad_2, b_half_2, b_grad_2, 0.f, 0.f, amp_out_L, amp_out_R, 1);
 
 		for (int i = 0; i < CHANNEL_SIZE; i++) {
 			INTER_CLAMP(a_half_3[i] = a0[i] + timestep * (-third * a_grad_1[i] + a_grad_2[i]));
@@ -378,7 +423,7 @@ struct WaveChannel {
 		}
 
 		// Round 3, 2/3 step
-		modelIteration( a_half_3, a_grad_3, b_half_3, b_grad_3, 0.f, 0.f, amp_out_L, amp_out_R);
+		modelIteration( a_half_3, a_grad_3, b_half_3, b_grad_3, 0.f, 0.f, amp_out_L, amp_out_R, 2);
 
 		for (int i = 0; i < CHANNEL_SIZE; i++) {
 			INTER_CLAMP(a_half_4[i] = a0[i] + timestep * (a_grad_1[i] - a_grad_2[i] + a_grad_3[i]));
@@ -386,7 +431,7 @@ struct WaveChannel {
 		}
 
 		// Round 4, whole step
-		modelIteration( a_half_4, a_grad_4, b_half_4, b_grad_4, 0.f, 0.f, amp_out_L, amp_out_R);
+		modelIteration( a_half_4, a_grad_4, b_half_4, b_grad_4, 0.f, 0.f, amp_out_L, amp_out_R, 3);
 
 		for (int i = 0; i < CHANNEL_SIZE; i++) {
 			//final result
@@ -396,8 +441,14 @@ struct WaveChannel {
 		}
 
 		// clamp to prevent blowups, but with a large range to avoid clipping in general
-		amp_out_L = math::clamp(amp_out_L,-100.0f,100.0f);
-		amp_out_R = math::clamp(amp_out_R,-100.0f,100.0f);
+		if (oversampling_mode == OversamplingMode::OVERSAMPLE_SINC) {
+			amp_out_L = math::clamp(decimator_output_L.process(decimator_input_L), -100.0f, 100.0f);
+			amp_out_R = math::clamp(decimator_output_R.process(decimator_input_R), -100.0f, 100.0f);
+		} else {
+			amp_out_L = math::clamp(amp_out_L,-100.0f,100.0f);
+			amp_out_R = math::clamp(amp_out_R,-100.0f,100.0f);
+		}
+
 	}
 
 	float sum(float_4 x) {
@@ -629,15 +680,15 @@ struct WaveChannel {
 				float_4 f_i = float_4(4.0*i, 4.0*i+1.0, 4.0*i+2.0, 4.0*i+3.0);
 
 				switch(probeType) {
-					case INTEGRAL:
+					case ProbeType::INTEGRAL:
 						w[i] = approxGaussian(pos, f_i, sigma);
 						w_sum += w[i];
 						break;
-					case DIFFERENTIAL:
+					case ProbeType::DIFFERENTIAL:
 						w[i] = approxGaussianDeriv(pos, f_i, sigma);
 						w_sum += simd::abs(w[i]);
 						break;
-					case SINC:
+					case ProbeType::SINC:
 						w[i] = sinc(pos, f_i, sigma);
 						w_sum += simd::abs(w[i]);
 						break;
@@ -807,8 +858,24 @@ struct WaveChannel {
 		return amp_out_R;
 	}
 
+	void setClipRange() {
+		switch(clip_range_mode) {
+			case ClipRange::V_10:
+				clip_range = 10.0f; break;
+			case ClipRange::V_30:
+				clip_range = 30.0f; break;
+			case ClipRange::V_60:
+				clip_range = 60.0f; break;
+			case ClipRange::V_100:
+				clip_range = 100.0f; break;
+			default:
+				clip_range = 30.0f; break;
+		}
+	}
+
 	// Update the ping-pong buffers
 	void update() {
+		setClipRange();
 		setModelPointer();
 		if (pong) {
 			RK4_iter_3_8s(v_a0, v_b0, v_a1, v_b1);
@@ -988,12 +1055,16 @@ struct WaterTable : Module {
 		damping_param.configExp(this, DAMPING_MIN, DAMPING_MAX, DAMPING_DEF, "damping", "Damping");
 		timestep_param.configPitch(this, TIMESTEP_POST_SCALE, 1.0, TIMESTEP_SHIFT, TIMESTEP_KNOB_MIN, TIMESTEP_KNOB_MAX, TIMESTEP_MAX, TIMESTEP_DEF, "timestep", "Timestep");
 		decay_param.configExp(this, DECAY_MIN, DECAY_MAX, DECAY_DEF, "decay", "Decay");
-		feedback_param.config(this, FEEDBACK_MIN, FEEDBACK_MAX, FEEDBACK_DEF, "feedback", "Feedback");
+		feedback_param.configBipolarExp(this, FEEDBACK_MIN, FEEDBACK_MAX, FEEDBACK_DEF, "feedback", "Feedback");
 		low_cut_param.config(this, LOW_CUT_MIN, LOW_CUT_MAX, LOW_CUT_DEF, "low_cut", "Low Cut");
 		input_gain_L_param.configExp(this, MIN_GAIN , MAX_GAIN, DEF_GAIN, "input_gain_L", "Input Gain L");
 		input_gain_R_param.configExp(this, MIN_GAIN , MAX_GAIN, DEF_GAIN, "input_gain_R", "Input Gain R");
 		dry_param.configExp(this, MIN_GAIN , MAX_GAIN, MIN_GAIN , "dry", "Dry Gain");
 		wet_param.configExp(this, MIN_GAIN , MAX_GAIN, DEF_GAIN, "wet", "Wet Gain");
+		configOutput(PROBE_OUT_L_OUTPUT, "Left output");
+		configOutput(PROBE_OUT_R_OUTPUT, "Right output");
+		configInput(PROBE_IN_L_INPUT, "Left input");
+		configInput(PROBE_IN_R_INPUT, "Right input");
 		lightDivider.setDivision(16);
 	}
 
@@ -1166,6 +1237,22 @@ struct WaterTable : Module {
 		}
 	}
 
+	int getOversamplingMode() {
+		return static_cast<int>(waveChannel.oversampling_mode);
+	}
+
+	void setOversamplingMode(int mode) {
+		waveChannel.oversampling_mode = static_cast<WaveChannel::OversamplingMode>(mode);
+	}
+
+	int getClipRangeMode() {
+		return static_cast<int>(waveChannel.clip_range_mode);
+	}
+
+	void setClipRangeMode(int mode) {
+		waveChannel.clip_range_mode = static_cast<WaveChannel::ClipRange>(mode);
+	}
+
 	void booleanFromJson(json_t* rootJ, bool &val, const char* json_label) {
 		json_t* j_val = json_object_get(rootJ, json_label);
 		if (j_val)
@@ -1196,6 +1283,26 @@ struct WaterTable : Module {
 		json_object_set_new(rootJ, json_label, json_integer(static_cast<int>(val)));
 	}
 
+	void oversamplingModeFromJson(json_t* rootJ, WaveChannel::OversamplingMode &val, const char* json_label) {
+		json_t* j_val = json_object_get(rootJ, json_label);
+		if (j_val)
+			val = static_cast<WaveChannel::OversamplingMode>(json_integer_value(j_val));
+	}
+
+	void oversamplingModeToJson(json_t* rootJ, WaveChannel::OversamplingMode &val, const char* json_label) {
+		json_object_set_new(rootJ, json_label, json_integer(static_cast<int>(val)));
+	}
+
+	void clipRangeModeFromJson(json_t* rootJ, WaveChannel::ClipRange &val, const char* json_label) {
+		json_t* j_val = json_object_get(rootJ, json_label);
+		if (j_val)
+			val = static_cast<WaveChannel::ClipRange>(json_integer_value(j_val));
+	}
+
+	void clipRangeModeToJson(json_t* rootJ, WaveChannel::ClipRange &val, const char* json_label) {
+		json_object_set_new(rootJ, json_label, json_integer(static_cast<int>(val)));
+	}
+
 	json_t* dataToJson() override {
 		json_t* rootJ = json_object();
 		pos_in_L_param.dataToJson(rootJ);
@@ -1209,6 +1316,8 @@ struct WaterTable : Module {
 		booleanToJson(rootJ, waveChannel.additive_mode_L, "additive_mode_L");
 		booleanToJson(rootJ, waveChannel.additive_mode_R, "additive_mode_R");
 		modelToJson(rootJ, waveChannel.model, "model");
+		oversamplingModeToJson(rootJ, waveChannel.oversampling_mode, "oversampling_mode");
+		clipRangeModeToJson(rootJ, waveChannel.clip_range_mode, "clip_range_mode");
 		return rootJ;
 	}
 
@@ -1224,6 +1333,24 @@ struct WaterTable : Module {
 		booleanFromJson(rootJ, waveChannel.additive_mode_L, "additive_mode_L");
 		booleanFromJson(rootJ, waveChannel.additive_mode_R, "additive_mode_R");
 		modelFromJson(rootJ, waveChannel.model, "model");
+		oversamplingModeFromJson(rootJ, waveChannel.oversampling_mode, "oversampling_mode");
+		clipRangeModeFromJson(rootJ, waveChannel.clip_range_mode, "clip_range_mode");
+	}
+
+	void onReset(const ResetEvent& e) override {
+		pos_in_L_param.reset();
+		pos_in_R_param.reset();
+		pos_out_L_param.reset();
+		pos_out_R_param.reset();
+		Module::onReset(e);
+	}
+
+	void onRandomize(const RandomizeEvent& e) override {
+		pos_in_L_param.randomize();
+		pos_in_R_param.randomize();
+		pos_out_L_param.randomize();
+		pos_out_R_param.randomize();
+		Module::onRandomize(e);
 	}
 };
 
@@ -1233,7 +1360,7 @@ struct WaterTableWidget : ModuleWidget {
 		setModule(module);
 		setPanel(APP->window->loadSvg(asset::plugin(pluginInstance, "res/WaterTable.svg")));
 
-		/*  lambas below MUST BE pass by value or we segfault when the reference goes out of scope.
+		/*  lambdas below MUST BE pass by value or we segfault when the reference goes out of scope.
 			this way of setting up the buttons is somewhat bizarre, but it does reduce boilerplate substantially.
 		*/
 		{
@@ -1257,7 +1384,7 @@ struct WaterTableWidget : ModuleWidget {
 					= createParamCentered<RoundToggleDark<WaterTable, 2>>(mm2px(Vec(18.94, 66.2)), module, WaterTable::MULTIPLICATIVE_BUTTON_L_PARAM);
 			button->config(
 				"Left Input Mode",
-				std::vector<std::string>{"ADDITIVE", "MULTIPLICATIVE"},
+				std::vector<std::string>{"MULTIPLICATIVE", "ADDITIVE"},
 				true, 
 				[=] () -> int { return module->waveChannel.additive_mode_L ? 1 : 0; }, 
 				[=] () -> void { module->waveChannel.toggleAdditiveModeL(); }, 
@@ -1272,7 +1399,7 @@ struct WaterTableWidget : ModuleWidget {
 					= createParamCentered<RoundToggleDark<WaterTable, 3>>(mm2px(Vec(48.062, 66.2)), module, WaterTable::MULTIPLICATIVE_BUTTON_R_PARAM);
 			button->config(
 				"Right Input Mode",
-				std::vector<std::string>{"ADDITIVE", "MULTIPLICATIVE", "DISABLED"},
+				std::vector<std::string>{"MULTIPLICATIVE", "ADDITIVE", "DISABLED"},
 				true, 
 				[=] () -> int { return module->waveChannel.isModMode() ? 2 : (module->waveChannel.additive_mode_R ? 1 : 0); }, 
 				[=] () -> void { if (!module->waveChannel.isModMode()) { module->waveChannel.toggleAdditiveModeR(); } }, 
@@ -1435,6 +1562,34 @@ struct WaterTableWidget : ModuleWidget {
 		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(46.861, 123.322)), module, WaterTable::DIFFERENTIAL_OUTPUT_R_LIGHT));
 		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(53.339, 123.322)), module, WaterTable::SINC_OUTPUT_R_LIGHT));
 
+	}
+
+	void appendContextMenu(Menu* menu) override {
+		WaterTable* module = dynamic_cast<WaterTable*>(this->module);
+		assert(module);
+
+		menu->addChild(new MenuSeparator);
+		//menu->addChild(createMenuLabel(""));
+
+		menu->addChild(createIndexSubmenuItem("Oversampling mode",
+			{"Sinc", "Biquad"},
+			[=]() {
+				return module->getOversamplingMode();
+			},
+			[=](int mode) {
+				module->setOversamplingMode(mode);
+			}
+		));
+
+		menu->addChild(createIndexSubmenuItem("Internal clip range",
+			{"10V", "30V", "60V", "100V"},
+			[=]() {
+				return module->getClipRangeMode();
+			},
+			[=](int mode) {
+				module->setClipRangeMode(mode);
+			}
+		));
 	}
 };
 
