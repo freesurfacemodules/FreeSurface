@@ -87,7 +87,7 @@ struct WaveChannel {
 
 	ModelPointer modelPointer;
 
-	float pos_in_L, pos_in_R, amp_in_L, amp_in_R, sig_in_L, sig_in_R, pos_out_L, pos_out_R, sig_out_L, sig_out_R;
+	float pos_in_L, pos_in_R, amp_in_L, amp_in_R, sig_in_L, sig_in_R, pos_out_L, pos_out_R, sig_out_L, sig_out_R = 0.0;
 	float amp_out_L, amp_out_R = 0.0; 
 	float amp_in_prev_L , amp_in_prev_R = 0.0;
 	float damping = 0.1; 
