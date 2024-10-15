@@ -55,7 +55,8 @@ inline float maxAll(Port& input) {
 }
 
 struct StereoDCBiasRemover {
-	float L, R = 0.0;
+	float L = 0.0;
+	float R = 0.0;
 	float decay = 0.0001;
 	void remove(float & in_L, float & in_R) {
 		L  = simd::crossfade(L, in_L, decay);
