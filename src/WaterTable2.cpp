@@ -1,7 +1,7 @@
 #include "plugin.hpp"
 #include "OpCache.hpp"
-#include "Profiler.hpp"
-#include <math.h>
+//#include "Profiler.hpp"
+#include <cmath>
 #include <cstring>
 
 using simd::float_4;
@@ -14,17 +14,23 @@ using simd::int32_4;
 
 // must be power-of-two
 #define CHANNEL_SIZE 16
+// 2 float4s, packed on x axis for a 8x8 grid
+#define CHANNEL_SIZE_X 2
+#define CHANNEL_SIZE_X_FLOATS 8
+#define CHANNEL_SIZE_Y 8
 #define CHANNEL_SIZE_FLOATS (CHANNEL_SIZE << 2)
 #define CHANNEL_MASK (CHANNEL_SIZE - 1)
 
 #define MAX_POSITION (CHANNEL_SIZE * 4.0)
 
+#define CHANNEL_MASK_X (CHANNEL_SIZE_X - 1)
+#define CHANNEL_MASK_X_FLOATS (CHANNEL_SIZE_X_FLOATS - 1)
+#define CHANNEL_MASK_Y (CHANNEL_SIZE_Y - 1)
 
-// WARNING! This will generate a HUGE amount of data in the log file 
-// when knobs are turned, or CV input is connected to the knob position/sigma
-//#define DEBUG_PROBE_PRINT
 
-struct WaveChannel {
+
+
+struct WaveChannel2 {
 	enum Model {
 		WAVE_EQUATION,
 		SQUID_AXON,
@@ -56,6 +62,17 @@ struct WaveChannel {
 	float clip_range = 30.0f;
 	ClipRange clip_range_mode = ClipRange::V_30;
 
+    /*
+     * TODO: this sinc filter sounds bad and introduces too much delay.
+     * I'm not sure if the bad sound is because of the delay or because it's
+     * truncated too much. Regardless I should rethink the upsampling/downsampling
+     * process. The biquad approach works OK, but needs a bit too low of a cutoff.
+     * A combo of lagrange interpolation plus a 1 pole filter might actually work
+     * better for upsampling. For downsampling I should look at other IIR filters.
+     * MAYBE I could filter the data at the source, but that's quite expensive.
+     * Could potentially improve stability but stability would presumably
+     * benefit mostly from filtering in space rather than in time.
+     */
 	dsp::BiquadFilter biquad_output_L;
 	dsp::BiquadFilter biquad_output_R;
 	dsp::BiquadFilter biquad_input_L;
@@ -75,8 +92,13 @@ struct WaveChannel {
 	/** Member function pointer for the current model.
 	 *  Nasty, but using a switch or inheritance would be nastier 
 	 *  here and probably worse for performance.
+     *  TODO: I'd like to know for certain whether introducing this
+     *   indirection hurts performance due to limiting compiler
+     *   optimization potential.
+     *   If so, I should consider templating everything and switching
+     *   models from top-down.
 	 */
-	typedef void (WaveChannel::*ModelPointer) (
+	typedef void (WaveChannel2::*ModelPointer) (
 		const std::vector<float_4>&, const std::vector<float_4>&, 
 		const std::vector<float_4>&, const std::vector<float_4>&,
 		const std::vector<float_4>&, const std::vector<float_4>&,
@@ -87,20 +109,9 @@ struct WaveChannel {
 
 	ModelPointer modelPointer;
 
-	float pos_in_L = 0.0;
-	float pos_in_R = 0.0;
-	float amp_in_L = 0.0; 
-	float amp_in_R = 0.0; 
-	float sig_in_L = 0.0;
-	float sig_in_R = 0.0;
-	float pos_out_L = 0.0;
-	float pos_out_R = 0.0;
-	float sig_out_L = 0.0;
-	float sig_out_R = 0.0;
-	float amp_out_L = 0.0;
-	float amp_out_R = 0.0; 
-	float amp_in_prev_L = 0.0;
-	float amp_in_prev_R = 0.0;
+	float pos_in_L, pos_in_R, amp_in_L, amp_in_R, sig_in_L, sig_in_R, pos_out_L, pos_out_R, sig_out_L, sig_out_R;
+	float amp_out_L, amp_out_R = 0.0; 
+	float amp_in_prev_L , amp_in_prev_R = 0.0;
 	float damping = 0.1; 
 	float timestep = 0.01;
 	float decay = 0.005;
@@ -137,9 +148,9 @@ struct WaveChannel {
 	std::vector<float_4> output_probe_L_window = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
 	std::vector<float_4> output_probe_R_window = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
 
-	WaveChannel() {
+	WaveChannel2() {
 		model = Model::WAVE_EQUATION;
-		modelPointer = &WaveChannel::stepWaveEquation;
+		modelPointer = &WaveChannel2::stepWaveEquation;
 		//const float biquad_cutoff = 0.125f;
 		const float biquad_cutoff = 0.0625f;
 		const float biquad_Q = 0.5f;
@@ -149,6 +160,19 @@ struct WaveChannel {
 		biquad_output_L.setParameters(dsp::BiquadFilter::Type::LOWPASS, biquad_cutoff, biquad_Q, biquad_gain);
 		biquad_output_R.setParameters(dsp::BiquadFilter::Type::LOWPASS, biquad_cutoff, biquad_Q, biquad_gain);
 	}
+
+    // TODO: will decide later on if I want to do 1D or 2D buffers throughout.
+    //  in the latter case this function should not be needed
+    // This works with unpacked float indices and is used for computing positions
+    // rather than indexing into a buffer
+    inline void indexToPosFloats(unsigned int index, unsigned int &x, unsigned int &y) {
+        x = index & CHANNEL_MASK_X_FLOATS;
+        y = index / CHANNEL_SIZE_X_FLOATS;
+    }
+
+    inline unsigned int posToIndex(unsigned int x, unsigned int y) {
+        return x + y * CHANNEL_SIZE_X;
+    }
 
 	// classic GLSL-style hermite smoothstep function
 	inline float_4 smoothstep(float_4 x) {
@@ -188,6 +212,7 @@ struct WaveChannel {
 
 	// Finds the closest distance from index to comp in a modular space.
 	// INDEX MUST BE IN THE RANGE 0 <= INDEX <= MAX_POSITION
+    // TODO: I don't think this is still valid if used for 2D coords?
 	inline float_4 wrappedSignedDistance(float_4 index, float_4 comp) {
 		float_4 c0 = simd::fabs(index - comp);
 		float_4 c1 = simd::fabs(index - comp + MAX_POSITION);
@@ -209,6 +234,7 @@ struct WaveChannel {
 
 	// Variation on smoothstep with the max value of the first derivative always <= 1.0
 	// This clamps without also amplifying the signal.
+    // TODO: it's nice that this is pretty fast, but I think a nicer-sounding alternative is feasible
 	inline float smoothclamp(float x, float low, float high) {
 		x = (2./3.) * x;
 		x = simd::clamp((x - low) / (high - low), 0., 1.);
@@ -218,9 +244,13 @@ struct WaveChannel {
 	/** computes a gaussian using the differences of the (approximate) error function
 	 *  this is a much better approach than simply sampling a gaussian because we can
 	 *  almost eliminate aliasing, even at small kernel sizes
+	 *  TODO: as much as I like all the little math tricks here, this stuff is overly slow
 	 */
-	inline float_4 approxGaussian(float_4 mean, float_4 x, float_4 sig) {
-		float_4 x_s = wrappedSignedDistance(x, mean);
+
+    // TODO: this will need to be substantially changed to deal with 2D
+	inline float_4 approxGaussian(float_4 x, float_4 sig) {
+		// float_4 x_s = wrappedSignedDistance(x, mean);
+        float_4 x_s = x;
 		float_4 x_d_l = x_s-0.5;
 		float_4 x_d_r = x_s+0.5;
 		float_4 xsq_l = x_d_l / (SQRT_2*sig);
@@ -233,9 +263,10 @@ struct WaveChannel {
 
 	/** Same as above, but we get the first derivative of a gaussian using an
 	 *  approximation of the first derivative of the error function.
+	 *  TODO: this will need to be substantially changed to deal with 2D
 	 */
-	inline float_4 approxGaussianDeriv(float_4 mean, float_4 x, float_4 sig) {
-		float_4 x_s = wrappedSignedDistance(x, mean);
+	inline float_4 approxGaussianDeriv(float_4 x, float_4 sig) {
+		float_4 x_s = x;
 		float_4 x_d_l = x_s-0.5;
 		float_4 x_d_r = x_s+0.5;
 		float_4 xsq_l = x_d_l / (SQRT_2*sig);
@@ -249,9 +280,13 @@ struct WaveChannel {
 	/** A sinc function.
 	 *  Using the integral trick to combat aliasing
 	 *  unfortunately doesn't work here.
+	 *  TODO: above statement is not strictly speaking true,
+	 *   could be done using a table for the Si(x) function, which
+	 *   may also be faster than calling simd::sin below.
+	 *  TODO: this will need to be substantially changed to deal with 2D
 	 */
-	inline float_4 sinc(float_4 center, float_4 x, float_4 sig) {
-		float_4 x_s = wrappedSignedDistance(x, center);
+	inline float_4 sinc(float_4 x, float_4 sig) {
+		float_4 x_s = x;
 		float_4 x_s2 = x_s / sig;
 		float_4 snc = simd::sin(x_s2)/x_s2;
 		float_4 almost_zero = simd::abs(x_s2) < 1.0e-6f;
@@ -268,9 +303,19 @@ struct WaveChannel {
 	 *  to get left-shifted and right-shifted vectors. After this point,
 	 *  we can do our simple calculations using SIMD ops.
 	*/
-	#define INDEX_MASK static_cast<unsigned int>(CHANNEL_MASK)
-	#define INDEX_MINUS_1 ((index-1) & INDEX_MASK)
-	#define INDEX_PLUS_1 ((index+1) & INDEX_MASK)
+    /*
+        TODO: let's do templating here so we can create
+         function specializations that only compute the derivatives needed.
+         This should open up the possibility for more models as well.
+        TODO: only the builtins need to change here for clang/gcc
+         I'd prefer two ifdef sections instead of two functions
+     */
+	#define INDEX_MASK_X static_cast<unsigned int>(CHANNEL_MASK_X)
+    #define INDEX_MASK_Y static_cast<unsigned int>(CHANNEL_MASK_Y)
+	#define INDEX_X_MINUS_1 ((index-1) & INDEX_MASK_X)
+	#define INDEX_X_PLUS_1 ((index+1) & INDEX_MASK_X)
+    #define INDEX_Y_MINUS_1 ((index-1) & INDEX_MASK_Y)
+    #define INDEX_Y_PLUS_1 ((index+1) & INDEX_MASK_Y)
 	#ifdef __APPLE__
 		typedef float v4sf __attribute__((__vector_size__(16)));
 		typedef int v4si __attribute__((__vector_size__(16)));
@@ -280,6 +325,8 @@ struct WaveChannel {
 			for (int index = 0; index < CHANNEL_SIZE; index++) {
 				v4sf e = FLOAT_4_TO_V4SF(x[INDEX_PLUS_1]);
 				v4sf w = FLOAT_4_TO_V4SF(x[INDEX_MINUS_1]);
+                v4sf n = FLOAT_4_TO_V4SF(x[INDEX_Y_PLUS_1]);
+                v4sf s = FLOAT_4_TO_V4SF(x[INDEX_Y_MINUS_1]);
 				v4sf c = FLOAT_4_TO_V4SF(x[index]);
 
 				float_4 shuffle_l = V4SF_TO_FLOAT_4(__builtin_shufflevector(c, e, 1, 2, 3, 4));
@@ -287,7 +334,7 @@ struct WaveChannel {
 
 				grad_out[index] = (shuffle_l - shuffle_r) / 2.0;
 
-				lapl_out[index] = shuffle_l + shuffle_r - 2.0 * x[index];
+				lapl_out[index] = n + s + shuffle_l + shuffle_r - 4.0 * x[index];
 			}
 		}
 	#else
@@ -299,16 +346,19 @@ struct WaveChannel {
 			v4si mask_l = {1,2,3,4};
 			v4si mask_r = {3,4,5,6};
 			for (int index = 0; index < CHANNEL_SIZE; index++) {
-				v4sf e = FLOAT_4_TO_V4SF(x[INDEX_PLUS_1]);
-				v4sf w = FLOAT_4_TO_V4SF(x[INDEX_MINUS_1]);
+				v4sf e = FLOAT_4_TO_V4SF(x[INDEX_X_PLUS_1]);
+				v4sf w = FLOAT_4_TO_V4SF(x[INDEX_X_MINUS_1]);
+                v4sf n = FLOAT_4_TO_V4SF(x[INDEX_Y_PLUS_1]);
+                v4sf s = FLOAT_4_TO_V4SF(x[INDEX_Y_MINUS_1]);
 				v4sf c = FLOAT_4_TO_V4SF(x[index]);
 
 				float_4 shuffle_l = V4SF_TO_FLOAT_4(__builtin_shuffle(c, e, mask_l));
 				float_4 shuffle_r = V4SF_TO_FLOAT_4(__builtin_shuffle(w, c, mask_r));
 
+                // TODO: change function sig for separate xy gradients
 				grad_out[index] = (shuffle_l - shuffle_r) / 2.0;
 
-				lapl_out[index] = shuffle_l + shuffle_r - 2.0 * x[index];
+				lapl_out[index] = n + s + shuffle_l + shuffle_r - 4.0 * x[index];
 			}
 		}
 	#endif
@@ -317,6 +367,7 @@ struct WaveChannel {
 	 *  overhead cost. Some of these (the _half_ vectors) could be reused, but it's not much
 	 *  memory and doing so would make the code significantly more confusing.
 	 */
+    // TODO: can we generalize this for a greater number of model parameters without trashing performance?
 	std::vector<float_4> a_grad_1 = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
 	std::vector<float_4> a_half_2 = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
 	std::vector<float_4> a_grad_2 = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
@@ -358,7 +409,7 @@ struct WaveChannel {
 
 		// no really special reason for this, but squid axon rapidly squashes
 		// inputs, so it can take more feedback
-		if (model == WaveChannel::SQUID_AXON) {
+		if (model == WaveChannel2::SQUID_AXON) {
 			input_L = feedback * 4.0 * INTER_CLAMP(0.25 * feedback_amp_L) + t_amp_in_L;
 			input_R = feedback * 4.0 * INTER_CLAMP(0.25 * feedback_amp_R) + t_amp_in_R;
 		} else {
@@ -367,12 +418,6 @@ struct WaveChannel {
 		}
 
 	}
-
-	/*
-	inline void processInputSample(float &input_L, float &input_R, const float &feedback_amp_L, const float &feedback_amp_R) {
-		input_L = biquad_input_L.process(feedback * INTER_CLAMP(feedback_amp_L) + input_L);
-		input_R = biquad_input_R.process(feedback * INTER_CLAMP(feedback_amp_R) + input_R);
-	}*/
 
 	inline void processOutputSample(float &sample_L, float &sample_R, int iter) {
 		if (oversampling_mode == OversamplingMode::OVERSAMPLE_SINC) {
@@ -406,6 +451,10 @@ struct WaveChannel {
 	 *  Using the 3/8s Runge Kutta method.
 	 *  Used to increase stability at large timesteps
 	 *  and also to upsample our input.
+	 *  TODO: if I figure out how to claw back some performance elsewhere, consider
+	 *   using a higher-order method here. Implicit solvers are probably off the table though
+	 *  TODO: consider instead using a two multidimensional vectors (for ping ponging)
+     *   so we can expand the number of parameters more freely
 	 */
 	void RK4_iter_3_8s(
 			const std::vector<float_4> &a0, const std::vector<float_4> &b0, 
@@ -425,7 +474,8 @@ struct WaveChannel {
 		}
 
 		// Round 2, 1/3 step
-		// input is only non-zero on the first round for upsampling		
+		// input is only non-zero on the first round for upsampling
+        // TODO: let's do lagrange interpolation instead
 		modelIteration( a_half_2, a_grad_2, b_half_2, b_grad_2, 0.f, 0.f, amp_out_L, amp_out_R, 1);
 
 		for (int i = 0; i < CHANNEL_SIZE; i++) {
@@ -471,11 +521,14 @@ struct WaveChannel {
 		(This limit is complicated somewhat when using RK4, 
 		but holds for euler integration and our laplacian stencil. 
 		RK4 raises the limit however, so 0.5 is a safe assumption)
+	    TODO: do a more complete stability analysis and update this for the
+	     larger laplacian norm from 2D
 	*/
 	inline float getSafeTimestep() {
 		return std::min(1.0f, 1.0f/(2.0f*timestep));
 	}
 
+    // TODO: I think the multiplicative mode doesn't bring much to the table and can be removed
 	void stepWaveEquation(
 		const std::vector<float_4> &a0, const std::vector<float_4> &b0, 
 		const std::vector<float_4> &laplacian_a, const std::vector<float_4> &laplacian_b,
@@ -503,26 +556,9 @@ struct WaveChannel {
 					(additive_mode_L ? probe_in_L : (a * probe_in_L)) + 
 					(additive_mode_R ? probe_in_R : (a * probe_in_R));
 
-			/*for equality mode below, may be completely implemented in the future
-			float_4 summed_probe_input = 
-					(additive_mode_L ? probe_in_L : 0.0) + 
-					(additive_mode_R ? probe_in_R : 0.0);*/
-
 			delta_a[i] = (summed_probe_input + b + safe_timestep * damping * laplacian_a[i] - decay * a - dc_bias_a[i]);
 			delta_b[i] = (laplacian_a[i] - decay * b - dc_bias_b[i]);
 
-			/* experimental "equality" mode
-			   this is not the objectively correct way to do this,
-			   but that way is much more expensive, either here or
-			   on the precomputation side.*/
-			/*
-			if (!additive_mode_L && !additive_mode_R) {
-				delta_a[i] = simd::crossfade(delta_a[i], t_input_L * input_probe_L_window[i] + t_input_R * input_probe_R_window[i], simd::abs(input_probe_L_window[i]) + simd::abs(input_probe_R_window[i]));
-			} else if (!additive_mode_R) {
-				delta_a[i] = simd::crossfade(delta_a[i], t_input_R * input_probe_R_window[i], simd::abs(input_probe_R_window[i]));
-			} else if (!additive_mode_L){
-				delta_a[i] = simd::crossfade(delta_a[i], t_input_L * input_probe_L_window[i], simd::abs(input_probe_L_window[i]));
-			}*/
 			dc_bias_a[i] = simd::crossfade(a, dc_bias_a[i],0.9995);
 			dc_bias_b[i] = simd::crossfade(b, dc_bias_b[i],0.9995);
 
@@ -620,6 +656,7 @@ struct WaveChannel {
 		t_amp_out_R = sum(probe_out_R);
 	}
 
+    // TODO: will need x and y gradients
 	void stepRK4Advection(		
 		const std::vector<float_4> &a0, const std::vector<float_4> &b0, 
 		const std::vector<float_4> &laplacian_a, const std::vector<float_4> &laplacian_b,
@@ -656,6 +693,7 @@ struct WaveChannel {
 			//		(additive_mode_R ? probe_in_R : (a * probe_in_R));
 
 			// gradients are smoothclamped for stability
+            // TODO: evaluate whether a better gradient clipping scheme might sound better
 			delta_a[i] = smoothclamp((summed_probe_input_a + safe_timestep * damping * laplacian_a[i] - decay * a)  // input
 					- probe_in_R * gradient_a[i], -10.0f, 10.0f); // advection
 
@@ -684,26 +722,39 @@ struct WaveChannel {
 	}
 
 	// Generate and normalize probe window buffers
+    // TODO: something wrong with either these weights or the laplacian calculation. find out which.
 	void generateProbeWindow(std::vector<float_4> &w, bool isDirty, float pos, float sigma, ProbeType probeType) {
 		if (isDirty || dirty_init) {
 			float_4 w_sum = float_4(0.0);
-			for (int i = 0; i < CHANNEL_SIZE; i++) {
-				float_4 f_i = float_4(4.0*i, 4.0*i+1.0, 4.0*i+2.0, 4.0*i+3.0);
+            // TODO: until I make probe position 2D throughout, don't bother with smooth probe position transitions
+            unsigned int posu = static_cast<unsigned int>(pos);
+            unsigned int posx;
+            unsigned int posy;
+            indexToPosFloats(posu, posx, posy);
+            float_4 p_x = float_4(static_cast<float>(posx));
+            float_4 p_y = float_4(static_cast<float>(posy));
 
-				switch(probeType) {
-					case ProbeType::INTEGRAL:
-						w[i] = approxGaussian(pos, f_i, sigma);
-						w_sum += w[i];
-						break;
-					case ProbeType::DIFFERENTIAL:
-						w[i] = approxGaussianDeriv(pos, f_i, sigma);
-						w_sum += simd::abs(w[i]);
-						break;
-					case ProbeType::SINC:
-						w[i] = sinc(pos, f_i, sigma);
-						w_sum += simd::abs(w[i]);
-						break;
-				}
+			for (unsigned int i = 0; i < CHANNEL_SIZE_X; i++) {
+                for (unsigned int j = 0; j < CHANNEL_SIZE_Y; j++) {
+                    float_4 f_x = float_4(4.0 * i, 4.0 * i + 1.0, 4.0 * i + 2.0, 4.0 * i + 3.0) - p_x;
+                    float_4 f_y = float_4(1.0 * j) - p_y;
+                    float_4 f_i = sqrt(f_x*f_x + f_y*f_y);
+                    unsigned int idx = posToIndex(i, j);
+                    switch (probeType) {
+                        case ProbeType::INTEGRAL:
+                            w[idx] = approxGaussian(f_i, sigma);
+                            w_sum += w[idx];
+                            break;
+                        case ProbeType::DIFFERENTIAL:
+                            w[idx] = approxGaussianDeriv(f_i, sigma);
+                            w_sum += simd::abs(w[idx]);
+                            break;
+                        case ProbeType::SINC:
+                            w[idx] = sinc(f_i, sigma);
+                            w_sum += simd::abs(w[idx]);
+                            break;
+                    }
+                }
 			}
 			float w_norm = sum(w_sum);
 			if (probeType == ProbeType::SINC) {
@@ -713,15 +764,20 @@ struct WaveChannel {
 				w[i] /= w_norm;
 			}
 
+            // WARNING! This will generate a HUGE amount of data in the log file
+            // when knobs are turned, or CV input is connected to the knob position/sigma
+            //#define DEBUG_PROBE_PRINT
 			#ifdef DEBUG_PROBE_PRINT
-				// WARNING! This will generate a HUGE amount of data in the log file 
-				// when knobs are turned, or CV input is connected to the knob position/sigma
 				std::string debug_string;
 				for (auto f : w) {
 					debug_string += std::to_string(f[0]) + " " + std::to_string(f[1]) + " " + std::to_string(f[2]) + " " + std::to_string(f[3]) + " ";
 				}
 				debug_string = "probe_generated: " + debug_string;
-				INFO(debug_string.c_str());
+				//INFO(debug_string.c_str());
+                std::cout << "posu " << posu << std::endl;
+                std::cout << "posx " << posx << std::endl;
+                std::cout << "posy " << posy << std::endl;
+                std::cout << debug_string << std::endl;
 			#endif
 			dirty_init = false;
 		}
@@ -816,16 +872,16 @@ struct WaveChannel {
 	void setModelPointer() {
 		switch(this->model) {
 			case SQUID_AXON:
-				this->modelPointer = &WaveChannel::stepSquidAxon;
+				this->modelPointer = &WaveChannel2::stepSquidAxon;
 				break;
 			case SCHRODINGER:
-				this->modelPointer = &WaveChannel::stepSchrodinger;
+				this->modelPointer = &WaveChannel2::stepSchrodinger;
 				break;
 			case RK4_ADVECTION:
-				this->modelPointer = &WaveChannel::stepRK4Advection;
+				this->modelPointer = &WaveChannel2::stepRK4Advection;
 				break;
 			case WAVE_EQUATION:
-				this->modelPointer = &WaveChannel::stepWaveEquation;
+				this->modelPointer = &WaveChannel2::stepWaveEquation;
 				break;
 		}
 	}
@@ -833,16 +889,16 @@ struct WaveChannel {
 	const char* getModelString() {
 		const char* text;
 		switch(model) {
-			case WaveChannel::Model::WAVE_EQUATION:
+			case WaveChannel2::Model::WAVE_EQUATION:
 				text = "WAVE_EQUATION";
 				break;
-			case WaveChannel::Model::SCHRODINGER:
+			case WaveChannel2::Model::SCHRODINGER:
 				text = "SCHRODINGER";
 				break;
-			case WaveChannel::Model::RK4_ADVECTION:
+			case WaveChannel2::Model::RK4_ADVECTION:
 				text = "RUNGE_KUTTA_RK4";
 				break;
-			case WaveChannel::Model::SQUID_AXON:
+			case WaveChannel2::Model::SQUID_AXON:
 				text = "SQUID_AXON";
 				break;
 			default:
@@ -854,7 +910,7 @@ struct WaveChannel {
 
 	bool isModMode() {
 		switch(model) {
-			case WaveChannel::Model::RK4_ADVECTION:
+			case WaveChannel2::Model::RK4_ADVECTION:
 				return true;
 			default:
 				return false;
@@ -898,7 +954,7 @@ struct WaveChannel {
 
 };
 
-struct WaterTable : Module {
+struct WaterTable2 : Module {
 	enum ParamIds {
 		MODEL_BUTTON_PARAM,
 		MULTIPLICATIVE_BUTTON_L_PARAM,
@@ -992,7 +1048,7 @@ struct WaterTable : Module {
 		NUM_LIGHTS
 	};
 
-	WaveChannel waveChannel;
+	WaveChannel2 waveChannel;
 	StereoDCBiasRemover dcBias;
 	FixedTimeExpSlewLimiter timestepSlewLimiter;
 	dsp::ClockDivider lightDivider;
@@ -1047,12 +1103,13 @@ struct WaterTable : Module {
 	#define FEEDBACK_MAX 8.0
 	#define FEEDBACK_DEF 0.0
 
+    // TODO: this should be specified in dB
 	#define MIN_GAIN 0.0
 	#define MAX_GAIN 8.0
 	#define DEF_GAIN 6.0
 
 	
-	WaterTable() : timestepSlewLimiter(TIMESTEP_SLEW_RATE) {
+	WaterTable2() : timestepSlewLimiter(TIMESTEP_SLEW_RATE) {
 		
 		config(NUM_PARAMS, NUM_INPUTS, NUM_OUTPUTS, NUM_LIGHTS);
 		pos_in_L_param.configModulo(this, MAX_POSITION, 0.0, "pos_in_L", "Left Input Probe Position");
@@ -1087,19 +1144,19 @@ struct WaterTable : Module {
 		waveChannel.setNextModel();
 	}
 
-	void setLightPatternProbeType(WaveChannel::ProbeType probeType, float &integralLight, float &differentialLight, float &sincLight, bool override) {
+	void setLightPatternProbeType(WaveChannel2::ProbeType probeType, float &integralLight, float &differentialLight, float &sincLight, bool override) {
 		switch(probeType) {
-			case WaveChannel::ProbeType::DIFFERENTIAL:
+			case WaveChannel2::ProbeType::DIFFERENTIAL:
 				differentialLight = 1.0;
 				integralLight = 0.0;
 				sincLight = 0.0;
 				break;
-			case WaveChannel::ProbeType::INTEGRAL:
+			case WaveChannel2::ProbeType::INTEGRAL:
 				differentialLight = 0.0;
 				integralLight = 1.0;
 				sincLight = 0.0;
 				break;
-			case WaveChannel::ProbeType::SINC:
+			case WaveChannel2::ProbeType::SINC:
 				differentialLight = 0.0;
 				integralLight = 0.0;
 				sincLight = 1.0;
@@ -1130,25 +1187,14 @@ struct WaterTable : Module {
 	void onReset() override {
 		waveChannel.additive_mode_L = true;
 		waveChannel.additive_mode_R = true;
-		waveChannel.input_probe_type_L = WaveChannel::ProbeType::INTEGRAL;
-		waveChannel.input_probe_type_R = WaveChannel::ProbeType::INTEGRAL;
-		waveChannel.output_probe_type_L = WaveChannel::ProbeType::INTEGRAL;
-		waveChannel.output_probe_type_R = WaveChannel::ProbeType::INTEGRAL;
+		waveChannel.input_probe_type_L = WaveChannel2::ProbeType::INTEGRAL;
+		waveChannel.input_probe_type_R = WaveChannel2::ProbeType::INTEGRAL;
+		waveChannel.output_probe_type_L = WaveChannel2::ProbeType::INTEGRAL;
+		waveChannel.output_probe_type_R = WaveChannel2::ProbeType::INTEGRAL;
 		waveChannel.dirty_init = true;
 	}
 
 	void process(const ProcessArgs& args) override {
-
-        /*
-                std::string debug_string;
-				for (auto f : w) {
-					debug_string += std::to_string(f[0]) + " " + std::to_string(f[1]) + " " + std::to_string(f[2]) + " " + std::to_string(f[3]) + " ";
-				}
-				debug_string = "probe_generated: " + debug_string;
-				INFO(debug_string.c_str());
-         */
-
-
 		float pos_in_L = pos_in_L_param.getValue();
 		float pos_in_R = pos_in_R_param.getValue();
 		float sig_in_L = sig_in_L_param.getValue();
@@ -1211,7 +1257,7 @@ struct WaterTable : Module {
 				float mod_light = 0.0;
 				bool disable_R_diff_add_lights = false;
 				switch(waveChannel.model) {
-					case WaveChannel::Model::RK4_ADVECTION:
+					case WaveChannel2::Model::RK4_ADVECTION:
 						pos_light = 0.0; mod_light = 1.0; 
 						disable_R_diff_add_lights = true;
 						break;
@@ -1264,7 +1310,7 @@ struct WaterTable : Module {
 	}
 
 	void setOversamplingMode(int mode) {
-		waveChannel.oversampling_mode = static_cast<WaveChannel::OversamplingMode>(mode);
+		waveChannel.oversampling_mode = static_cast<WaveChannel2::OversamplingMode>(mode);
 	}
 
 	int getClipRangeMode() {
@@ -1272,7 +1318,7 @@ struct WaterTable : Module {
 	}
 
 	void setClipRangeMode(int mode) {
-		waveChannel.clip_range_mode = static_cast<WaveChannel::ClipRange>(mode);
+		waveChannel.clip_range_mode = static_cast<WaveChannel2::ClipRange>(mode);
 	}
 
 	void booleanFromJson(json_t* rootJ, bool &val, const char* json_label) {
@@ -1285,43 +1331,43 @@ struct WaterTable : Module {
 		json_object_set_new(rootJ, json_label, json_boolean(val));
 	}
 
-	void modelFromJson(json_t* rootJ, WaveChannel::Model &val, const char* json_label) {
+	void modelFromJson(json_t* rootJ, WaveChannel2::Model &val, const char* json_label) {
 		json_t* j_val = json_object_get(rootJ, json_label);
 		if (j_val)
-			val = static_cast<WaveChannel::Model>(json_integer_value(j_val));
+			val = static_cast<WaveChannel2::Model>(json_integer_value(j_val));
 	}
 
-	void modelToJson(json_t* rootJ, WaveChannel::Model &val, const char* json_label) {
+	void modelToJson(json_t* rootJ, WaveChannel2::Model &val, const char* json_label) {
 		json_object_set_new(rootJ, json_label, json_integer(static_cast<int>(val)));
 	}
 
-	void probeFromJson(json_t* rootJ, WaveChannel::ProbeType &val, const char* json_label) {
+	void probeFromJson(json_t* rootJ, WaveChannel2::ProbeType &val, const char* json_label) {
 		json_t* j_val = json_object_get(rootJ, json_label);
 		if (j_val)
-			val = static_cast<WaveChannel::ProbeType>(json_integer_value(j_val));
+			val = static_cast<WaveChannel2::ProbeType>(json_integer_value(j_val));
 	}
 
-	void probeToJson(json_t* rootJ, WaveChannel::ProbeType &val, const char* json_label) {
+	void probeToJson(json_t* rootJ, WaveChannel2::ProbeType &val, const char* json_label) {
 		json_object_set_new(rootJ, json_label, json_integer(static_cast<int>(val)));
 	}
 
-	void oversamplingModeFromJson(json_t* rootJ, WaveChannel::OversamplingMode &val, const char* json_label) {
+	void oversamplingModeFromJson(json_t* rootJ, WaveChannel2::OversamplingMode &val, const char* json_label) {
 		json_t* j_val = json_object_get(rootJ, json_label);
 		if (j_val)
-			val = static_cast<WaveChannel::OversamplingMode>(json_integer_value(j_val));
+			val = static_cast<WaveChannel2::OversamplingMode>(json_integer_value(j_val));
 	}
 
-	void oversamplingModeToJson(json_t* rootJ, WaveChannel::OversamplingMode &val, const char* json_label) {
+	void oversamplingModeToJson(json_t* rootJ, WaveChannel2::OversamplingMode &val, const char* json_label) {
 		json_object_set_new(rootJ, json_label, json_integer(static_cast<int>(val)));
 	}
 
-	void clipRangeModeFromJson(json_t* rootJ, WaveChannel::ClipRange &val, const char* json_label) {
+	void clipRangeModeFromJson(json_t* rootJ, WaveChannel2::ClipRange &val, const char* json_label) {
 		json_t* j_val = json_object_get(rootJ, json_label);
 		if (j_val)
-			val = static_cast<WaveChannel::ClipRange>(json_integer_value(j_val));
+			val = static_cast<WaveChannel2::ClipRange>(json_integer_value(j_val));
 	}
 
-	void clipRangeModeToJson(json_t* rootJ, WaveChannel::ClipRange &val, const char* json_label) {
+	void clipRangeModeToJson(json_t* rootJ, WaveChannel2::ClipRange &val, const char* json_label) {
 		json_object_set_new(rootJ, json_label, json_integer(static_cast<int>(val)));
 	}
 
@@ -1348,13 +1394,13 @@ struct WaterTable : Module {
 		pos_in_R_param.dataFromJson(rootJ);
 		pos_out_L_param.dataFromJson(rootJ);
 		pos_out_R_param.dataFromJson(rootJ);
-		probeFromJson(rootJ, waveChannel.input_probe_type_L, "input_probe_type_L");
-		probeFromJson(rootJ, waveChannel.input_probe_type_R, "input_probe_type_R");
-		probeFromJson(rootJ, waveChannel.output_probe_type_L, "output_probe_type_L");
-		probeFromJson(rootJ, waveChannel.output_probe_type_R, "output_probe_type_R");
+		probeFromJson(rootJ,   waveChannel.input_probe_type_L, "input_probe_type_L");
+		probeFromJson(rootJ,   waveChannel.input_probe_type_R, "input_probe_type_R");
+		probeFromJson(rootJ,   waveChannel.output_probe_type_L, "output_probe_type_L");
+		probeFromJson(rootJ,   waveChannel.output_probe_type_R, "output_probe_type_R");
 		booleanFromJson(rootJ, waveChannel.additive_mode_L, "additive_mode_L");
 		booleanFromJson(rootJ, waveChannel.additive_mode_R, "additive_mode_R");
-		modelFromJson(rootJ, waveChannel.model, "model");
+		modelFromJson(rootJ,   waveChannel.model, "model");
 		oversamplingModeFromJson(rootJ, waveChannel.oversampling_mode, "oversampling_mode");
 		clipRangeModeFromJson(rootJ, waveChannel.clip_range_mode, "clip_range_mode");
 	}
@@ -1377,8 +1423,8 @@ struct WaterTable : Module {
 };
 
 
-struct WaterTableWidget : ModuleWidget {
-	WaterTableWidget(WaterTable* module) {
+struct WaterTable2Widget : ModuleWidget {
+	WaterTable2Widget(WaterTable2* module) {
 		setModule(module);
 		setPanel(APP->window->loadSvg(asset::plugin(pluginInstance, "res/WaterTable.svg")));
 
@@ -1386,105 +1432,105 @@ struct WaterTableWidget : ModuleWidget {
 			this way of setting up the buttons is somewhat bizarre, but it does reduce boilerplate substantially.
 		*/
 		{
-			//addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(69.566, 83.327)), module, WaterTable::MODEL_BUTTON_PARAM));
-			FreeSurfaceLogoToggleDark<WaterTable, 4>* button 
-					= createParamCentered<FreeSurfaceLogoToggleDark<WaterTable, 4>>(mm2px(Vec(69.566, 83.327)), module, WaterTable::MODEL_BUTTON_PARAM);
+			//addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(69.566, 83.327)), module, WaterTable2::MODEL_BUTTON_PARAM));
+			FreeSurfaceLogoToggleDark<WaterTable2, 4>* button 
+					= createParamCentered<FreeSurfaceLogoToggleDark<WaterTable2, 4>>(mm2px(Vec(69.566, 83.327)), module, WaterTable2::MODEL_BUTTON_PARAM);
 			button->config(
 				"Model", 
 				std::vector<std::string>{"WAVE EQUATION", "SQUID AXON", "SCHRODINGER", "RUNGE KUTTA RK4"},
 				true, 
-				[=] () -> int { return static_cast<int>(module->waveChannel.model); }, 
-				[=] () -> void { module->waveChannel.setNextModel(); }, 
+				[=] () -> int { return static_cast<int>(module->waveChannel.model); },
+				[=] () -> void { module->waveChannel.setNextModel(); },
 				module
 			);
 			addParam(button);
 		}
 
 		{
-			//addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(18.94, 66.2)), module, WaterTable::MULTIPLICATIVE_BUTTON_L_PARAM));
-			RoundToggleDark<WaterTable, 2>* button 
-					= createParamCentered<RoundToggleDark<WaterTable, 2>>(mm2px(Vec(18.94, 66.2)), module, WaterTable::MULTIPLICATIVE_BUTTON_L_PARAM);
+			//addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(18.94, 66.2)), module, WaterTable2::MULTIPLICATIVE_BUTTON_L_PARAM));
+			RoundToggleDark<WaterTable2, 2>* button 
+					= createParamCentered<RoundToggleDark<WaterTable2, 2>>(mm2px(Vec(18.94, 66.2)), module, WaterTable2::MULTIPLICATIVE_BUTTON_L_PARAM);
 			button->config(
 				"Left Input Mode",
 				std::vector<std::string>{"MULTIPLICATIVE", "ADDITIVE"},
 				true, 
-				[=] () -> int { return module->waveChannel.additive_mode_L ? 1 : 0; }, 
-				[=] () -> void { module->waveChannel.toggleAdditiveModeL(); }, 
+				[=] () -> int { return module->waveChannel.additive_mode_L ? 1 : 0; },
+				[=] () -> void { module->waveChannel.toggleAdditiveModeL(); },
 				module
 			);
 			addParam(button);
 		}
 
 		{
-			//addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(48.062, 66.2)), module, WaterTable::MULTIPLICATIVE_BUTTON_R_PARAM));
-			RoundToggleDark<WaterTable, 3>* button 
-					= createParamCentered<RoundToggleDark<WaterTable, 3>>(mm2px(Vec(48.062, 66.2)), module, WaterTable::MULTIPLICATIVE_BUTTON_R_PARAM);
+			//addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(48.062, 66.2)), module, WaterTable2::MULTIPLICATIVE_BUTTON_R_PARAM));
+			RoundToggleDark<WaterTable2, 3>* button 
+					= createParamCentered<RoundToggleDark<WaterTable2, 3>>(mm2px(Vec(48.062, 66.2)), module, WaterTable2::MULTIPLICATIVE_BUTTON_R_PARAM);
 			button->config(
 				"Right Input Mode",
 				std::vector<std::string>{"MULTIPLICATIVE", "ADDITIVE", "DISABLED"},
 				true, 
-				[=] () -> int { return module->waveChannel.isModMode() ? 2 : (module->waveChannel.additive_mode_R ? 1 : 0); }, 
-				[=] () -> void { if (!module->waveChannel.isModMode()) { module->waveChannel.toggleAdditiveModeR(); } }, 
+				[=] () -> int { return module->waveChannel.isModMode() ? 2 : (module->waveChannel.additive_mode_R ? 1 : 0); },
+				[=] () -> void { if (!module->waveChannel.isModMode()) { module->waveChannel.toggleAdditiveModeR(); } },
 				module
 			);
 			addParam(button);
 		}
 
 		{
-			//addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(5.018, 66.198)), module, WaterTable::INPUT_PROBE_TYPE_BUTTON_L_PARAM));
-			RoundToggleDark<WaterTable, 3>* button 
-					= createParamCentered<RoundToggleDark<WaterTable, 3>>(mm2px(Vec(5.018, 66.198)), module, WaterTable::INPUT_PROBE_TYPE_BUTTON_L_PARAM);
+			//addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(5.018, 66.198)), module, WaterTable2::INPUT_PROBE_TYPE_BUTTON_L_PARAM));
+			RoundToggleDark<WaterTable2, 3>* button 
+					= createParamCentered<RoundToggleDark<WaterTable2, 3>>(mm2px(Vec(5.018, 66.198)), module, WaterTable2::INPUT_PROBE_TYPE_BUTTON_L_PARAM);
 			button->config(
 				"Left Input Shape",
 				std::vector<std::string>{"INTEGRAL", "DIFFERENTIAL", "SINC"},
 				true, 
-				[=] () -> int { return static_cast<int>(module->waveChannel.input_probe_type_L); }, 
-				[=] () -> void { module->waveChannel.toggleInputProbeTypeL(); }, 
+				[=] () -> int { return static_cast<int>(module->waveChannel.input_probe_type_L); },
+				[=] () -> void { module->waveChannel.toggleInputProbeTypeL(); },
 				module
 			);
 			addParam(button);
 		}
 
 		{
-			//addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(34.14, 66.198)), module, WaterTable::INPUT_PROBE_TYPE_BUTTON_R_PARAM));
-			RoundToggleDark<WaterTable, 4>* button 
-					= createParamCentered<RoundToggleDark<WaterTable, 4>>(mm2px(Vec(34.14, 66.198)), module, WaterTable::INPUT_PROBE_TYPE_BUTTON_R_PARAM);
+			//addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(34.14, 66.198)), module, WaterTable2::INPUT_PROBE_TYPE_BUTTON_R_PARAM));
+			RoundToggleDark<WaterTable2, 4>* button 
+					= createParamCentered<RoundToggleDark<WaterTable2, 4>>(mm2px(Vec(34.14, 66.198)), module, WaterTable2::INPUT_PROBE_TYPE_BUTTON_R_PARAM);
 			button->config(
 				"Right Input Shape",
 				std::vector<std::string>{"INTEGRAL", "DIFFERENTIAL", "SINC", "DISABLED"},
 				true, 
-				[=] () -> int { return module->waveChannel.isModMode() ? 3 : static_cast<int>(module->waveChannel.input_probe_type_R); }, 
-				[=] () -> void { if (!module->waveChannel.isModMode()) { module->waveChannel.toggleInputProbeTypeR(); } }, 
+				[=] () -> int { return module->waveChannel.isModMode() ? 3 : static_cast<int>(module->waveChannel.input_probe_type_R); },
+				[=] () -> void { if (!module->waveChannel.isModMode()) { module->waveChannel.toggleInputProbeTypeR(); } },
 				module
 			);
 			addParam(button);
 		}
 
 		{
-			//addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(4.991, 121.739)), module, WaterTable::OUTPUT_PROBE_TYPE_BUTTON_L_PARAM));
-			RoundToggleDark<WaterTable, 3>* button 
-					= createParamCentered<RoundToggleDark<WaterTable, 3>>(mm2px(Vec(4.991, 121.739)), module, WaterTable::OUTPUT_PROBE_TYPE_BUTTON_L_PARAM);
+			//addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(4.991, 121.739)), module, WaterTable2::OUTPUT_PROBE_TYPE_BUTTON_L_PARAM));
+			RoundToggleDark<WaterTable2, 3>* button 
+					= createParamCentered<RoundToggleDark<WaterTable2, 3>>(mm2px(Vec(4.991, 121.739)), module, WaterTable2::OUTPUT_PROBE_TYPE_BUTTON_L_PARAM);
 			button->config(
 				"Left Output Shape",
 				std::vector<std::string>{"INTEGRAL", "DIFFERENTIAL", "SINC"},
 				true, 
-				[=] () -> int { return static_cast<int>(module->waveChannel.output_probe_type_L); }, 
-				[=] () -> void { module->waveChannel.toggleOutputProbeTypeL(); }, 
+				[=] () -> int { return static_cast<int>(module->waveChannel.output_probe_type_L); },
+				[=] () -> void { module->waveChannel.toggleOutputProbeTypeL(); },
 				module
 			);
 			addParam(button);
 		}
 
 		{
-			//addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(34.287, 121.739)), module, WaterTable::OUTPUT_PROBE_TYPE_BUTTON_R_PARAM));
-			RoundToggleDark<WaterTable, 3>* button 
-					= createParamCentered<RoundToggleDark<WaterTable, 3>>(mm2px(Vec(34.287, 121.739)), module, WaterTable::OUTPUT_PROBE_TYPE_BUTTON_R_PARAM);
+			//addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(34.287, 121.739)), module, WaterTable2::OUTPUT_PROBE_TYPE_BUTTON_R_PARAM));
+			RoundToggleDark<WaterTable2, 3>* button 
+					= createParamCentered<RoundToggleDark<WaterTable2, 3>>(mm2px(Vec(34.287, 121.739)), module, WaterTable2::OUTPUT_PROBE_TYPE_BUTTON_R_PARAM);
 			button->config(
 				"Right Output Shape",
 				std::vector<std::string>{"INTEGRAL", "DIFFERENTIAL", "SINC"},
 				true, 
-				[=] () -> int { return static_cast<int>(module->waveChannel.output_probe_type_R); }, 
-				[=] () -> void { module->waveChannel.toggleOutputProbeTypeR(); }, 
+				[=] () -> int { return static_cast<int>(module->waveChannel.output_probe_type_R); },
+				[=] () -> void { module->waveChannel.toggleOutputProbeTypeR(); },
 				module
 			);
 			addParam(button);
@@ -1493,7 +1539,7 @@ struct WaterTableWidget : ModuleWidget {
 		{
 			// mm2px(Vec(60.444, 62.491))
 			//addChild(createWidget<Widget>(mm2px(Vec(59.822, 9.072))));
-			WaterTableDisplay<WaterTable, CHANNEL_SIZE, CHANNEL_SIZE_FLOATS>* display = new WaterTableDisplay<WaterTable, CHANNEL_SIZE, CHANNEL_SIZE_FLOATS>();
+			WaterTable2Display<WaterTable2, CHANNEL_SIZE, CHANNEL_SIZE_FLOATS>* display = new WaterTable2Display<WaterTable2, CHANNEL_SIZE, CHANNEL_SIZE_FLOATS>();
 			display->module = module;
 			display->box.pos = mm2px(Vec(59.822, 9.072));
 			display->box.size = mm2px(Vec(60.444, 62.491));
@@ -1503,91 +1549,91 @@ struct WaterTableWidget : ModuleWidget {
 		
 		
 
-		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(23.75, 19.313)), module, WaterTable::POSITION_IN_L_CV_PARAM));
-		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(53.046, 19.313)), module, WaterTable::POSITION_IN_R_CV_PARAM));
-		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(6.421, 40.993)), module, WaterTable::PROBE_SIGMA_IN_L_CV_PARAM));
-		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(35.717, 40.993)), module, WaterTable::PROBE_SIGMA_IN_R_CV_PARAM));
-		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(6.421, 53.047)), module, WaterTable::INPUT_GAIN_L_CV_PARAM));
-		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(35.676, 53.047)), module, WaterTable::INPUT_GAIN_R_CV_PARAM));
-		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(23.75, 89.313)), module, WaterTable::POSITION_OUT_L_CV_PARAM));
-		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(53.046, 89.313)), module, WaterTable::POSITION_OUT_R_CV_PARAM));
-		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(83.969, 104.575)), module, WaterTable::DAMPING_CV_PARAM));
-		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(94.324, 104.575)), module, WaterTable::DECAY_CV_PARAM));
-		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(104.848, 104.575)), module, WaterTable::FEEDBACK_CV_PARAM));
-		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(115.382, 104.575)), module, WaterTable::LOW_CUT_CV_PARAM));
-		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(6.421, 110.41)), module, WaterTable::PROBE_SIGMA_OUT_L_CV_PARAM));
-		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(35.676, 110.41)), module, WaterTable::PROBE_SIGMA_OUT_R_CV_PARAM));
-		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(95.75, 93.843)), module, WaterTable::DRY_CV_PARAM));
-		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(115.288, 93.843)), module, WaterTable::WET_CV_PARAM));
+		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(23.75, 19.313)), module, WaterTable2::POSITION_IN_L_CV_PARAM));
+		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(53.046, 19.313)), module, WaterTable2::POSITION_IN_R_CV_PARAM));
+		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(6.421, 40.993)), module, WaterTable2::PROBE_SIGMA_IN_L_CV_PARAM));
+		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(35.717, 40.993)), module, WaterTable2::PROBE_SIGMA_IN_R_CV_PARAM));
+		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(6.421, 53.047)), module, WaterTable2::INPUT_GAIN_L_CV_PARAM));
+		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(35.676, 53.047)), module, WaterTable2::INPUT_GAIN_R_CV_PARAM));
+		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(23.75, 89.313)), module, WaterTable2::POSITION_OUT_L_CV_PARAM));
+		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(53.046, 89.313)), module, WaterTable2::POSITION_OUT_R_CV_PARAM));
+		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(83.969, 104.575)), module, WaterTable2::DAMPING_CV_PARAM));
+		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(94.324, 104.575)), module, WaterTable2::DECAY_CV_PARAM));
+		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(104.848, 104.575)), module, WaterTable2::FEEDBACK_CV_PARAM));
+		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(115.382, 104.575)), module, WaterTable2::LOW_CUT_CV_PARAM));
+		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(6.421, 110.41)), module, WaterTable2::PROBE_SIGMA_OUT_L_CV_PARAM));
+		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(35.676, 110.41)), module, WaterTable2::PROBE_SIGMA_OUT_R_CV_PARAM));
+		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(95.75, 93.843)), module, WaterTable2::DRY_CV_PARAM));
+		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(115.288, 93.843)), module, WaterTable2::WET_CV_PARAM));
 
-		addParam(createParamCentered<VektronixInfiniteBigKnob>(mm2px(Vec(10.25, 24.063)), module, WaterTable::POSITION_IN_L_PARAM));
-		addParam(createParamCentered<VektronixInfiniteBigKnob>(mm2px(Vec(39.546, 24.063)), module, WaterTable::POSITION_IN_R_PARAM));
-		addParam(createParamCentered<VektronixInfiniteBigKnob>(mm2px(Vec(10.25, 94.063)), module, WaterTable::POSITION_OUT_L_PARAM));
-		addParam(createParamCentered<VektronixInfiniteBigKnob>(mm2px(Vec(39.546, 94.063)), module, WaterTable::POSITION_OUT_R_PARAM));
+		addParam(createParamCentered<VektronixInfiniteBigKnob>(mm2px(Vec(10.25, 24.063)), module, WaterTable2::POSITION_IN_L_PARAM));
+		addParam(createParamCentered<VektronixInfiniteBigKnob>(mm2px(Vec(39.546, 24.063)), module, WaterTable2::POSITION_IN_R_PARAM));
+		addParam(createParamCentered<VektronixInfiniteBigKnob>(mm2px(Vec(10.25, 94.063)), module, WaterTable2::POSITION_OUT_L_PARAM));
+		addParam(createParamCentered<VektronixInfiniteBigKnob>(mm2px(Vec(39.546, 94.063)), module, WaterTable2::POSITION_OUT_R_PARAM));
 
-		addParam(createParamCentered<VektronixBigKnobDark>(mm2px(Vec(69.566, 109.631)), module, WaterTable::TIMESTEP_PARAM));
-		addParam(createParamCentered<VektronixBigKnobDark>(mm2px(Vec(110.538, 81.989)), module, WaterTable::WET_PARAM));
-		addParam(createParamCentered<VektronixBigKnobDark>(mm2px(Vec(91.0, 82.107)), module, WaterTable::DRY_PARAM));
+		addParam(createParamCentered<VektronixBigKnobDark>(mm2px(Vec(69.566, 109.631)), module, WaterTable2::TIMESTEP_PARAM));
+		addParam(createParamCentered<VektronixBigKnobDark>(mm2px(Vec(110.538, 81.989)), module, WaterTable2::WET_PARAM));
+		addParam(createParamCentered<VektronixBigKnobDark>(mm2px(Vec(91.0, 82.107)), module, WaterTable2::DRY_PARAM));
 
-		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(15.222, 40.64)), module, WaterTable::PROBE_SIGMA_IN_L_PARAM));
-		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(44.176, 40.64)), module, WaterTable::PROBE_SIGMA_IN_R_PARAM));
-		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(15.222, 110.41)), module, WaterTable::PROBE_SIGMA_OUT_L_PARAM));
-		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(44.176, 110.41)), module, WaterTable::PROBE_SIGMA_OUT_R_PARAM));
-		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(83.969, 112.384)), module, WaterTable::DAMPING_PARAM));
-		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(94.324, 112.392)), module, WaterTable::DECAY_PARAM));
-		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(104.848, 112.392)), module, WaterTable::FEEDBACK_PARAM));
-		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(115.382, 112.392)), module, WaterTable::LOW_CUT_PARAM));
-		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(15.222, 52.798)), module, WaterTable::INPUT_GAIN_L_PARAM));
-		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(44.176, 52.798)), module, WaterTable::INPUT_GAIN_R_PARAM));
+		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(15.222, 40.64)), module, WaterTable2::PROBE_SIGMA_IN_L_PARAM));
+		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(44.176, 40.64)), module, WaterTable2::PROBE_SIGMA_IN_R_PARAM));
+		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(15.222, 110.41)), module, WaterTable2::PROBE_SIGMA_OUT_L_PARAM));
+		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(44.176, 110.41)), module, WaterTable2::PROBE_SIGMA_OUT_R_PARAM));
+		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(83.969, 112.384)), module, WaterTable2::DAMPING_PARAM));
+		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(94.324, 112.392)), module, WaterTable2::DECAY_PARAM));
+		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(104.848, 112.392)), module, WaterTable2::FEEDBACK_PARAM));
+		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(115.382, 112.392)), module, WaterTable2::LOW_CUT_PARAM));
+		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(15.222, 52.798)), module, WaterTable2::INPUT_GAIN_L_PARAM));
+		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(44.176, 52.798)), module, WaterTable2::INPUT_GAIN_R_PARAM));
 
-		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(15.222, 7.244)), module, WaterTable::PROBE_IN_L_INPUT));
-		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(44.296, 7.244)), module, WaterTable::PROBE_IN_R_INPUT));
-		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(23.75, 28.063)), module, WaterTable::PROBE_POSITION_IN_L_INPUT));
-		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(53.046, 28.063)), module, WaterTable::PROBE_POSITION_IN_R_INPUT));
-		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(23.75, 40.64)), module, WaterTable::PROBE_SIGMA_IN_L_INPUT));
-		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(53.046, 40.64)), module, WaterTable::PROBE_SIGMA_IN_R_INPUT));
-		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(23.75, 52.691)), module, WaterTable::INPUT_GAIN_L_INPUT));
-		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(53.046, 52.691)), module, WaterTable::INPUT_GAIN_R_INPUT));
-		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(87.0, 93.843)), module, WaterTable::DRY_INPUT));
-		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(106.538, 93.843)), module, WaterTable::WET_INPUT));
-		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(23.75, 98.063)), module, WaterTable::PROBE_POSITION_OUT_L_INPUT));
-		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(53.046, 98.063)), module, WaterTable::PROBE_POSITION_OUT_R_INPUT));
-		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(23.75, 110.41)), module, WaterTable::PROBE_SIGMA_OUT_L_INPUT));
-		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(53.046, 110.41)), module, WaterTable::PROBE_SIGMA_OUT_R_INPUT));
-		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(73.56, 120.947)), module, WaterTable::TIMESTEP_INPUT));
-		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(83.969, 120.947)), module, WaterTable::DAMPING_INPUT));
-		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(94.324, 120.947)), module, WaterTable::DECAY_INPUT));
-		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(104.848, 120.947)), module, WaterTable::FEEDBACK_INPUT));
-		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(115.382, 120.947)), module, WaterTable::LOW_CUT_INPUT));
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(15.222, 7.244)), module, WaterTable2::PROBE_IN_L_INPUT));
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(44.296, 7.244)), module, WaterTable2::PROBE_IN_R_INPUT));
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(23.75, 28.063)), module, WaterTable2::PROBE_POSITION_IN_L_INPUT));
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(53.046, 28.063)), module, WaterTable2::PROBE_POSITION_IN_R_INPUT));
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(23.75, 40.64)), module, WaterTable2::PROBE_SIGMA_IN_L_INPUT));
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(53.046, 40.64)), module, WaterTable2::PROBE_SIGMA_IN_R_INPUT));
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(23.75, 52.691)), module, WaterTable2::INPUT_GAIN_L_INPUT));
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(53.046, 52.691)), module, WaterTable2::INPUT_GAIN_R_INPUT));
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(87.0, 93.843)), module, WaterTable2::DRY_INPUT));
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(106.538, 93.843)), module, WaterTable2::WET_INPUT));
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(23.75, 98.063)), module, WaterTable2::PROBE_POSITION_OUT_L_INPUT));
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(53.046, 98.063)), module, WaterTable2::PROBE_POSITION_OUT_R_INPUT));
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(23.75, 110.41)), module, WaterTable2::PROBE_SIGMA_OUT_L_INPUT));
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(53.046, 110.41)), module, WaterTable2::PROBE_SIGMA_OUT_R_INPUT));
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(73.56, 120.947)), module, WaterTable2::TIMESTEP_INPUT));
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(83.969, 120.947)), module, WaterTable2::DAMPING_INPUT));
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(94.324, 120.947)), module, WaterTable2::DECAY_INPUT));
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(104.848, 120.947)), module, WaterTable2::FEEDBACK_INPUT));
+		addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(115.382, 120.947)), module, WaterTable2::LOW_CUT_INPUT));
 
-		addOutput(createOutputCentered<VektronixPortBorderlessDark>(mm2px(Vec(15.222, 78.379)), module, WaterTable::PROBE_OUT_L_OUTPUT));
-		addOutput(createOutputCentered<VektronixPortBorderlessDark>(mm2px(Vec(44.296, 78.379)), module, WaterTable::PROBE_OUT_R_OUTPUT));
+		addOutput(createOutputCentered<VektronixPortBorderlessDark>(mm2px(Vec(15.222, 78.379)), module, WaterTable2::PROBE_OUT_L_OUTPUT));
+		addOutput(createOutputCentered<VektronixPortBorderlessDark>(mm2px(Vec(44.296, 78.379)), module, WaterTable2::PROBE_OUT_R_OUTPUT));
 
 
-		addChild(createLightCentered<SmallLight<RedLight>>(mm2px(Vec(118.795, 4.673)), module, WaterTable::EOC_LIGHT));
-		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(55.628, 5.978)), module, WaterTable::POS_MODE_LIGHT));
-		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(55.628, 8.295)), module, WaterTable::MOD_MODE_LIGHT));
-		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(26.398, 63.259)), module, WaterTable::ADDITIVE_L_LIGHT));
-		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(15.033, 63.278)), module, WaterTable::INTEGRAL_INPUT_L_LIGHT));
-		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(44.155, 63.278)), module, WaterTable::INTEGRAL_INPUT_R_LIGHT));
-		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(55.52, 63.278)), module, WaterTable::ADDITIVE_R_LIGHT));
-		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(15.033, 66.2)), module, WaterTable::DIFFERENTIAL_INPUT_L_LIGHT));
-		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(44.155, 66.2)), module, WaterTable::DIFFERENTIAL_INPUT_R_LIGHT));
-		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(15.033, 69.123)), module, WaterTable::SINC_INPUT_L_LIGHT));
-		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(44.155, 69.123)), module, WaterTable::SINC_INPUT_R_LIGHT));
-		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(55.52, 69.123)), module, WaterTable::MULTIPLICATIVE_R_LIGHT));
-		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(26.398, 69.141)), module, WaterTable::MULTIPLICATIVE_L_LIGHT));
-		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(11.437, 123.322)), module, WaterTable::INTEGRAL_OUTPUT_L_LIGHT));
-		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(17.915, 123.322)), module, WaterTable::DIFFERENTIAL_OUTPUT_L_LIGHT));
-		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(24.393, 123.322)), module, WaterTable::SINC_OUTPUT_L_LIGHT));
-		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(40.383, 123.322)), module, WaterTable::INTEGRAL_OUTPUT_R_LIGHT));
-		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(46.861, 123.322)), module, WaterTable::DIFFERENTIAL_OUTPUT_R_LIGHT));
-		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(53.339, 123.322)), module, WaterTable::SINC_OUTPUT_R_LIGHT));
+		addChild(createLightCentered<SmallLight<RedLight>>(mm2px(Vec(118.795, 4.673)), module, WaterTable2::EOC_LIGHT));
+		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(55.628, 5.978)), module, WaterTable2::POS_MODE_LIGHT));
+		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(55.628, 8.295)), module, WaterTable2::MOD_MODE_LIGHT));
+		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(26.398, 63.259)), module, WaterTable2::ADDITIVE_L_LIGHT));
+		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(15.033, 63.278)), module, WaterTable2::INTEGRAL_INPUT_L_LIGHT));
+		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(44.155, 63.278)), module, WaterTable2::INTEGRAL_INPUT_R_LIGHT));
+		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(55.52, 63.278)), module, WaterTable2::ADDITIVE_R_LIGHT));
+		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(15.033, 66.2)), module, WaterTable2::DIFFERENTIAL_INPUT_L_LIGHT));
+		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(44.155, 66.2)), module, WaterTable2::DIFFERENTIAL_INPUT_R_LIGHT));
+		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(15.033, 69.123)), module, WaterTable2::SINC_INPUT_L_LIGHT));
+		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(44.155, 69.123)), module, WaterTable2::SINC_INPUT_R_LIGHT));
+		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(55.52, 69.123)), module, WaterTable2::MULTIPLICATIVE_R_LIGHT));
+		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(26.398, 69.141)), module, WaterTable2::MULTIPLICATIVE_L_LIGHT));
+		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(11.437, 123.322)), module, WaterTable2::INTEGRAL_OUTPUT_L_LIGHT));
+		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(17.915, 123.322)), module, WaterTable2::DIFFERENTIAL_OUTPUT_L_LIGHT));
+		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(24.393, 123.322)), module, WaterTable2::SINC_OUTPUT_L_LIGHT));
+		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(40.383, 123.322)), module, WaterTable2::INTEGRAL_OUTPUT_R_LIGHT));
+		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(46.861, 123.322)), module, WaterTable2::DIFFERENTIAL_OUTPUT_R_LIGHT));
+		addChild(createLightCentered<TinyLight<RedLight>>(mm2px(Vec(53.339, 123.322)), module, WaterTable2::SINC_OUTPUT_R_LIGHT));
 
 	}
 
 	void appendContextMenu(Menu* menu) override {
-		WaterTable* module = dynamic_cast<WaterTable*>(this->module);
+		WaterTable2* module = dynamic_cast<WaterTable2*>(this->module);
 		assert(module);
 
 		menu->addChild(new MenuSeparator);
@@ -1616,4 +1662,4 @@ struct WaterTableWidget : ModuleWidget {
 };
 
 
-Model* modelWaterTable = createModel<WaterTable, WaterTableWidget>("FreeSurface-WaterTable");
+Model* modelWaterTable2 = createModel<WaterTable2, WaterTable2Widget>("FreeSurface-WaterTable2");

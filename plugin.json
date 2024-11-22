@@ -17,6 +17,12 @@
       "name": "WaterTable",
       "description": "Physical modeling system with a fully analog design",
       "tags": ["Distortion", "Filter", "Panning", "Ring modulator", "Physical modeling"]
+    },
+    {
+      "slug": "FreeSurface-WaterTable2",
+      "name": "WaterTable2",
+      "description": "Physical modeling system with a fully analog design",
+      "tags": ["Distortion", "Filter", "Panning", "Ring modulator", "Physical modeling"]
     }
   ]
 }
