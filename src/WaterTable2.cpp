@@ -109,14 +109,26 @@ struct WaveChannel2 {
 
 	ModelPointer modelPointer;
 
-	float pos_in_L, pos_in_R, amp_in_L, amp_in_R, sig_in_L, sig_in_R, pos_out_L, pos_out_R, sig_out_L, sig_out_R;
-	float amp_out_L, amp_out_R = 0.0; 
-	float amp_in_prev_L , amp_in_prev_R = 0.0;
-	float damping = 0.1; 
-	float timestep = 0.01;
-	float decay = 0.005;
-	float feedback = 0.0;
-	float low_cut = 0.0;
+    float pos_in_L = 0.0;
+    float pos_in_R = 0.0;
+    float amp_in_L = 0.0;
+    float amp_in_R = 0.0;
+    float sig_in_L = 0.0;
+    float sig_in_R = 0.0;
+    float pos_out_L = 0.0;
+    float pos_out_R = 0.0;
+    float sig_out_L = 0.0;
+    float sig_out_R = 0.0;
+    float amp_out_L = 0.0;
+    float amp_out_R = 0.0;
+    float amp_in_prev_L = 0.0;
+    float amp_in_prev_R = 0.0;
+    float damping = 0.1;
+    float timestep = 0.01;
+    float decay = 0.005;
+    float feedback = 0.0;
+    float low_cut = 0.0;
+    float anisotropy = 0.0;
 
 	// ping pong buffer setup
 	bool pong = false;
@@ -148,6 +160,13 @@ struct WaveChannel2 {
 	std::vector<float_4> output_probe_L_window = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
 	std::vector<float_4> output_probe_R_window = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
 
+    // kernel weights
+    std::vector<float_4> kernel_weight_N = std::vector<float_4>(CHANNEL_SIZE, float_4(1.));
+    std::vector<float_4> kernel_weight_E = std::vector<float_4>(CHANNEL_SIZE, float_4(1.));
+    std::vector<float_4> kernel_weight_S = std::vector<float_4>(CHANNEL_SIZE, float_4(1.));
+    std::vector<float_4> kernel_weight_W = std::vector<float_4>(CHANNEL_SIZE, float_4(1.));
+    std::vector<float_4> kernel_weight_C = std::vector<float_4>(CHANNEL_SIZE, float_4(-4.));
+
 	WaveChannel2() {
 		model = Model::WAVE_EQUATION;
 		modelPointer = &WaveChannel2::stepWaveEquation;
@@ -168,6 +187,11 @@ struct WaveChannel2 {
     inline void indexToPosFloats(unsigned int index, unsigned int &x, unsigned int &y) {
         x = index & CHANNEL_MASK_X_FLOATS;
         y = index / CHANNEL_SIZE_X_FLOATS;
+    }
+
+    inline void indexToPos(unsigned int index, unsigned int &x, unsigned int &y) {
+        x = index & CHANNEL_MASK_X;
+        y = index / CHANNEL_SIZE_X;
     }
 
     inline unsigned int posToIndex(unsigned int x, unsigned int y) {
@@ -307,61 +331,60 @@ struct WaveChannel2 {
         TODO: let's do templating here so we can create
          function specializations that only compute the derivatives needed.
          This should open up the possibility for more models as well.
-        TODO: only the builtins need to change here for clang/gcc
-         I'd prefer two ifdef sections instead of two functions
+        TODO: if we make the laplacian kernel weights modifiable, the structure
+         of the kernel weight data has big performance implications.
+         At the moment the most sensible thing seems to be to have separate arrays
+         of float_4s for N,S,E,W cardinal directions, although that does necessitate shuffling
+         them in the same way we do values.
      */
 	#define INDEX_MASK_X static_cast<unsigned int>(CHANNEL_MASK_X)
     #define INDEX_MASK_Y static_cast<unsigned int>(CHANNEL_MASK_Y)
-	#define INDEX_X_MINUS_1 ((index-1) & INDEX_MASK_X)
-	#define INDEX_X_PLUS_1 ((index+1) & INDEX_MASK_X)
-    #define INDEX_Y_MINUS_1 ((index-1) & INDEX_MASK_Y)
-    #define INDEX_Y_PLUS_1 ((index+1) & INDEX_MASK_Y)
-	#ifdef __APPLE__
-		typedef float v4sf __attribute__((__vector_size__(16)));
-		typedef int v4si __attribute__((__vector_size__(16)));
-		#define V4SF_TO_FLOAT_4(v) float_4(reinterpret_cast<__m128>(v))
-		#define FLOAT_4_TO_V4SF(f) reinterpret_cast<v4sf>(f.v)
-		inline void gradient_and_laplacian(const std::vector<float_4> &x, std::vector<float_4> &grad_out, std::vector<float_4> &lapl_out) {
-			for (int index = 0; index < CHANNEL_SIZE; index++) {
-				v4sf e = FLOAT_4_TO_V4SF(x[INDEX_PLUS_1]);
-				v4sf w = FLOAT_4_TO_V4SF(x[INDEX_MINUS_1]);
-                v4sf n = FLOAT_4_TO_V4SF(x[INDEX_Y_PLUS_1]);
-                v4sf s = FLOAT_4_TO_V4SF(x[INDEX_Y_MINUS_1]);
-				v4sf c = FLOAT_4_TO_V4SF(x[index]);
+    // can these be simplified?
+    #define INDEX_Y_BASE (index / CHANNEL_SIZE_X)
+    #define INDEX_X_BASE (index & INDEX_MASK_X)
+	#define INDEX_X_MINUS_1 (INDEX_Y_BASE * CHANNEL_SIZE_X + ((index-1) & INDEX_MASK_X))
+	#define INDEX_X_PLUS_1 (INDEX_Y_BASE * CHANNEL_SIZE_X + ((index+1) & INDEX_MASK_X))
+    #define INDEX_Y_MINUS_1 (((INDEX_Y_BASE-1) & INDEX_MASK_Y) * CHANNEL_SIZE_X + INDEX_X_BASE)
+    #define INDEX_Y_PLUS_1 (((INDEX_Y_BASE+1) & INDEX_MASK_Y) * CHANNEL_SIZE_X + INDEX_X_BASE)
 
-				float_4 shuffle_l = V4SF_TO_FLOAT_4(__builtin_shufflevector(c, e, 1, 2, 3, 4));
-				float_4 shuffle_r = V4SF_TO_FLOAT_4(__builtin_shufflevector(w, c, 3, 4, 5, 6));
+    #ifdef __APPLE__
+        typedef float v4sf __attribute__((__vector_size__(16)));
+        typedef int v4si __attribute__((__vector_size__(16)));
+    #else
+        typedef float v4sf __attribute__ ((vector_size (16)));
+        typedef int v4si __attribute__ ((vector_size (16)));
+        const v4si mask_l = {1,2,3,4};
+        const v4si mask_r = {3,4,5,6};
+    #endif
+    #define V4SF_TO_FLOAT_4(v) float_4(reinterpret_cast<__m128>(v))
+    #define FLOAT_4_TO_V4SF(f) reinterpret_cast<v4sf>(f.v)
+    inline void gradient_and_laplacian(const std::vector<float_4> &x, std::vector<float_4> &grad_out, std::vector<float_4> &lapl_out) {
+        for (unsigned int index = 0; index < CHANNEL_SIZE; index++) {
+            v4sf e = FLOAT_4_TO_V4SF(x[INDEX_X_PLUS_1]);
+            v4sf w = FLOAT_4_TO_V4SF(x[INDEX_X_MINUS_1]);
+            v4sf n = FLOAT_4_TO_V4SF(x[INDEX_Y_PLUS_1]);
+            v4sf s = FLOAT_4_TO_V4SF(x[INDEX_Y_MINUS_1]);
+            v4sf c = FLOAT_4_TO_V4SF(x[index]);
 
-				grad_out[index] = (shuffle_l - shuffle_r) / 2.0;
+            #ifdef __APPLE__
+                float_4 shuffle_l = V4SF_TO_FLOAT_4(__builtin_shufflevector(c, e, 1, 2, 3, 4));
+                float_4 shuffle_r = V4SF_TO_FLOAT_4(__builtin_shufflevector(w, c, 3, 4, 5, 6));
+            #else
+                float_4 shuffle_l = V4SF_TO_FLOAT_4(__builtin_shuffle(c, e, mask_l));
+                float_4 shuffle_r = V4SF_TO_FLOAT_4(__builtin_shuffle(w, c, mask_r));
+            #endif
+            // TODO: change function sig for separate xy gradients
+            grad_out[index] = (shuffle_l - shuffle_r) / 2.0;
 
-				lapl_out[index] = n + s + shuffle_l + shuffle_r - 4.0 * x[index];
-			}
-		}
-	#else
-		typedef float v4sf __attribute__ ((vector_size (16)));
-		typedef int v4si __attribute__ ((vector_size (16)));
-		#define V4SF_TO_FLOAT_4(v) float_4(reinterpret_cast<__m128>(v))
-		#define FLOAT_4_TO_V4SF(f) reinterpret_cast<v4sf>(f.v)
-		inline void gradient_and_laplacian(const std::vector<float_4> &x, std::vector<float_4> &grad_out, std::vector<float_4> &lapl_out) {
-			v4si mask_l = {1,2,3,4};
-			v4si mask_r = {3,4,5,6};
-			for (int index = 0; index < CHANNEL_SIZE; index++) {
-				v4sf e = FLOAT_4_TO_V4SF(x[INDEX_X_PLUS_1]);
-				v4sf w = FLOAT_4_TO_V4SF(x[INDEX_X_MINUS_1]);
-                v4sf n = FLOAT_4_TO_V4SF(x[INDEX_Y_PLUS_1]);
-                v4sf s = FLOAT_4_TO_V4SF(x[INDEX_Y_MINUS_1]);
-				v4sf c = FLOAT_4_TO_V4SF(x[index]);
+            lapl_out[index] =
+                      kernel_weight_N[index] * n
+                    + kernel_weight_S[index] * s
+                    + kernel_weight_E[index] * shuffle_l // are E and W correct here?
+                    + kernel_weight_W[index] * shuffle_r
+                    + kernel_weight_C[index] * x[index];
+        }
+    }
 
-				float_4 shuffle_l = V4SF_TO_FLOAT_4(__builtin_shuffle(c, e, mask_l));
-				float_4 shuffle_r = V4SF_TO_FLOAT_4(__builtin_shuffle(w, c, mask_r));
-
-                // TODO: change function sig for separate xy gradients
-				grad_out[index] = (shuffle_l - shuffle_r) / 2.0;
-
-				lapl_out[index] = n + s + shuffle_l + shuffle_r - 4.0 * x[index];
-			}
-		}
-	#endif
 
 	/** Temporaries for RK4 integration. Declaring them in function scope incurs a huge
 	 *  overhead cost. Some of these (the _half_ vectors) could be reused, but it's not much
@@ -717,12 +740,18 @@ struct WaveChannel2 {
 	bool output_probe_R_dirty = true;
 	bool dirty_init = true;
 
+    bool kernel_weights_dirty = true;
+    bool kernel_weights_dirty_init = true;
+
 	void setDirtyProbe(bool& dirty_flag, const float& pos_prev, const float& sig_prev, const float& pos_next, const float& sig_next) {
 		dirty_flag = (pos_prev != pos_next || sig_prev != sig_next);
 	}
 
+    void setDirtyKernelWeights(bool& dirty_flag, const float& anisotropy_prev, const float& anisotropy_next) {
+        dirty_flag = (anisotropy_prev != anisotropy_next);
+    }
+
 	// Generate and normalize probe window buffers
-    // TODO: something wrong with either these weights or the laplacian calculation. find out which.
 	void generateProbeWindow(std::vector<float_4> &w, bool isDirty, float pos, float sigma, ProbeType probeType) {
 		if (isDirty || dirty_init) {
 			float_4 w_sum = float_4(0.0);
@@ -802,6 +831,54 @@ struct WaveChannel2 {
 		generateProbeWindow(output_probe_L_window, output_probe_L_dirty, this->pos_out_L, this->sig_out_L, output_probe_type_L);
 		generateProbeWindow(output_probe_R_window, output_probe_R_dirty, this->pos_out_R, this->sig_out_R, output_probe_type_R);
 	}
+
+    void setKernelSettings(float anisotropy) {
+        setDirtyKernelWeights(kernel_weights_dirty, this->anisotropy, anisotropy);
+        this->anisotropy = anisotropy;
+        generateKernelWeights(anisotropy, kernel_weights_dirty);
+    }
+
+    /*
+     * Design considerations for kernel weight modification
+     * It seems sensible to store separate kernel weights in separate arrays of float_4s
+     * for each cardinal direction, in order to match the structure of the laplacian calculation.
+     * The center (vertex) weight for the laplacian stencil is simply the negation of the sum of edge weights.
+     * This means we could just store the edge weights and not the vertex weight, but that also entails
+     * computing the vertex weight every time we need to compute the laplacian. So, it seems sensible to compute
+     * it ahead of time, meaning we'll also compute a vertex weight array. This computation is, on the whole,
+     * a bit simpler than what we're doing to compute antialiased probe weights, but it will still be relatively
+     * expensive, meaning that we should use a similar approach to the above to change the weights only when needed.
+     *
+     * For an initial test run of this idea, we'll simply provide a control for the anisotropy of the kernel.
+     */
+
+    // let's say for now that anisotropy = 1 means maximum horizontal / vertical ratio,
+    // and anistropy = -1 means maximum vertical / horizontal ratio
+    // For stability reasons, we'll probably want to fix the larger of the two values to 1,
+    // although through testing we can find if larger values are feasible
+    void generateKernelWeights(float anisotropy, bool isDirty) {
+        if (isDirty || kernel_weights_dirty_init) {
+            float h_weight = 1.;
+            float v_weight = 1.;
+            if (anisotropy < 0.) {
+                h_weight = 1./(1. - anisotropy * 4.);
+            } else {
+                v_weight = 1./(1. + anisotropy * 4.);
+            }
+            float c_weight = -(2.*h_weight + 2.*v_weight);
+            for (int i = 0; i < CHANNEL_SIZE_X; i++) {
+                for (int j = 0; j < CHANNEL_SIZE_Y; j++) {
+                    unsigned int idx = posToIndex(i, j);
+                    kernel_weight_N[idx] = float_4(v_weight);
+                    kernel_weight_S[idx] = float_4(v_weight);
+                    kernel_weight_E[idx] = float_4(h_weight);
+                    kernel_weight_W[idx] = float_4(h_weight);
+                    kernel_weight_C[idx] = float_4(c_weight);
+                }
+            }
+        }
+        kernel_weights_dirty_init = false;
+    }
 
 	void toggleAdditiveModeL() {
 		additive_mode_L = !additive_mode_L;
@@ -996,6 +1073,7 @@ struct WaterTable2 : Module {
 		DAMPING_CV_PARAM,
 		DECAY_CV_PARAM,
 		FEEDBACK_CV_PARAM,
+        ANISOTROPY_PARAM,
 		NUM_PARAMS
 	};
 	enum InputIds {
@@ -1018,6 +1096,7 @@ struct WaterTable2 : Module {
 		DECAY_INPUT,
 		FEEDBACK_INPUT,
 		TIMESTEP_INPUT,
+        ANISOTROPY_INPUT,
 		NUM_INPUTS
 	};
 	enum OutputIds {
@@ -1073,6 +1152,9 @@ struct WaterTable2 : Module {
 	CVParamInput<LOW_CUT_PARAM,  LOW_CUT_INPUT,   LOW_CUT_CV_PARAM> low_cut_param;
 	CVParamInput<DRY_PARAM,  DRY_INPUT,   DRY_CV_PARAM> dry_param;
 	CVParamInput<WET_PARAM,  WET_INPUT,   WET_CV_PARAM> wet_param;
+
+    CVParamInput<ANISOTROPY_PARAM, ANISOTROPY_INPUT, DUMMY_CV> anisotropy_param;
+
 	
 	#define PROBE_SIGMA_MIN 0.25
 	#define PROBE_SIGMA_MAX 4.0
@@ -1129,6 +1211,7 @@ struct WaterTable2 : Module {
 		input_gain_R_param.configExp(this, MIN_GAIN , MAX_GAIN, DEF_GAIN, "input_gain_R", "Input Gain R");
 		dry_param.configExp(this, MIN_GAIN , MAX_GAIN, MIN_GAIN , "dry", "Dry Gain");
 		wet_param.configExp(this, MIN_GAIN , MAX_GAIN, DEF_GAIN, "wet", "Wet Gain");
+        anisotropy_param.config(this, -1.0, 1.0, 0.0, "anisotropy", "Anisotropy");
 		configOutput(PROBE_OUT_L_OUTPUT, "Left");
 		configOutput(PROBE_OUT_R_OUTPUT, "Right");
 		configInput(PROBE_IN_L_INPUT, "Left");
@@ -1207,6 +1290,7 @@ struct WaterTable2 : Module {
 		float decay = decay_param.getValue();
 		float feedback = feedback_param.getValue();
 		float low_cut = low_cut_param.getValue();
+        float anisotropy = anisotropy_param.getValue();
 
 		float sample_rate_scale = 96000.0f / args.sampleRate;
 		timestep_param.setSampleRateScale(sample_rate_scale);
@@ -1225,6 +1309,7 @@ struct WaterTable2 : Module {
 		if (anyOutputsConnected()) {
 			waveChannel.setParams(damping, timestep, decay, low_cut, feedback);
 			waveChannel.setProbeSettings(pos_in_L, pos_in_R, pos_out_L, pos_out_R, sig_in_L, sig_in_R, sig_out_L, sig_out_R);
+            waveChannel.setKernelSettings(anisotropy);
 			waveChannel.setProbeInputs(input_gain_L_param.getValue() * amp_in_L, input_gain_R_param.getValue() * amp_in_R);
 			waveChannel.update();
 			amp_out_L = waveChannel.getAmpOutL();
@@ -1547,7 +1632,7 @@ struct WaterTable2Widget : ModuleWidget {
 			addChild(display);
 		}
 		
-		
+
 
 		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(23.75, 19.313)), module, WaterTable2::POSITION_IN_L_CV_PARAM));
 		addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(53.046, 19.313)), module, WaterTable2::POSITION_IN_R_CV_PARAM));
@@ -1574,6 +1659,9 @@ struct WaterTable2Widget : ModuleWidget {
 		addParam(createParamCentered<VektronixBigKnobDark>(mm2px(Vec(69.566, 109.631)), module, WaterTable2::TIMESTEP_PARAM));
 		addParam(createParamCentered<VektronixBigKnobDark>(mm2px(Vec(110.538, 81.989)), module, WaterTable2::WET_PARAM));
 		addParam(createParamCentered<VektronixBigKnobDark>(mm2px(Vec(91.0, 82.107)), module, WaterTable2::DRY_PARAM));
+
+        addParam(createParamCentered<VektronixTinyKnobDark>(mm2px(Vec(110.538, 70.0)), module, WaterTable2::ANISOTROPY_PARAM));
+        addInput(createInputCentered<VektronixPortBorderlessDark>(mm2px(Vec(100, 70.0)), module, WaterTable2::ANISOTROPY_INPUT));
 
 		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(15.222, 40.64)), module, WaterTable2::PROBE_SIGMA_IN_L_PARAM));
 		addParam(createParamCentered<VektronixSmallKnobDark>(mm2px(Vec(44.176, 40.64)), module, WaterTable2::PROBE_SIGMA_IN_R_PARAM));

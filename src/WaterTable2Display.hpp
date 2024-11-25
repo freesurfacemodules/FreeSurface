@@ -114,7 +114,7 @@ struct WaterTable2Display : TransparentWidget {
         #ifdef DEBUG_PROBE_WEIGHT
             const float displacement = 10.0f;
         #else
-            const float displacement = 2.0f;
+            const float displacement = 20.0f;
         #endif
 
         // -1 because we plot two points per iteration
