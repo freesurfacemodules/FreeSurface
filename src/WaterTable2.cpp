@@ -3,32 +3,10 @@
 //#include "Profiler.hpp"
 #include <cmath>
 #include <cstring>
+#include "Integrator.h"
 
 using simd::float_4;
 using simd::int32_4;
-
-// 2^30 * ln(2)
-#define EXP2_30_TO_EXP 744261117.954893018
-#define ONE_OVER_SQRT_TWO_PI 0.3989422804
-#define SQRT_2 1.41421356237
-
-// must be power-of-two
-#define CHANNEL_SIZE 16
-// 2 float4s, packed on x axis for a 8x8 grid
-#define CHANNEL_SIZE_X 2
-#define CHANNEL_SIZE_X_FLOATS 8
-#define CHANNEL_SIZE_Y 8
-#define CHANNEL_SIZE_FLOATS (CHANNEL_SIZE << 2)
-#define CHANNEL_MASK (CHANNEL_SIZE - 1)
-
-#define MAX_POSITION (CHANNEL_SIZE * 4.0)
-
-#define CHANNEL_MASK_X (CHANNEL_SIZE_X - 1)
-#define CHANNEL_MASK_X_FLOATS (CHANNEL_SIZE_X_FLOATS - 1)
-#define CHANNEL_MASK_Y (CHANNEL_SIZE_Y - 1)
-
-
-
 
 struct WaveChannel2 {
 	enum Model {
@@ -37,6 +15,7 @@ struct WaveChannel2 {
 		SCHRODINGER,
 		RK4_ADVECTION
 	};
+
 	Model model;
 
 	enum ProbeType {
@@ -61,53 +40,6 @@ struct WaveChannel2 {
 
 	float clip_range = 30.0f;
 	ClipRange clip_range_mode = ClipRange::V_30;
-
-    /*
-     * TODO: this sinc filter sounds bad and introduces too much delay.
-     * I'm not sure if the bad sound is because of the delay or because it's
-     * truncated too much. Regardless I should rethink the upsampling/downsampling
-     * process. The biquad approach works OK, but needs a bit too low of a cutoff.
-     * A combo of lagrange interpolation plus a 1 pole filter might actually work
-     * better for upsampling. For downsampling I should look at other IIR filters.
-     * MAYBE I could filter the data at the source, but that's quite expensive.
-     * Could potentially improve stability but stability would presumably
-     * benefit mostly from filtering in space rather than in time.
-     */
-	dsp::BiquadFilter biquad_output_L;
-	dsp::BiquadFilter biquad_output_R;
-	dsp::BiquadFilter biquad_input_L;
-	dsp::BiquadFilter biquad_input_R;
-
-	dsp::Decimator<4, 64> decimator_output_L;
-	dsp::Decimator<4, 64> decimator_output_R;
-	dsp::Upsampler<4, 64> upsampler_input_L;
-	dsp::Upsampler<4, 64> upsampler_input_R;
-
-	float upsampler_result_input_L[4] = {0};
-	float upsampler_result_input_R[4] = {0};
-	float decimator_input_L[4] = {0};
-	float decimator_input_R[4] = {0};
-        
-
-	/** Member function pointer for the current model.
-	 *  Nasty, but using a switch or inheritance would be nastier 
-	 *  here and probably worse for performance.
-     *  TODO: I'd like to know for certain whether introducing this
-     *   indirection hurts performance due to limiting compiler
-     *   optimization potential.
-     *   If so, I should consider templating everything and switching
-     *   models from top-down.
-	 */
-	typedef void (WaveChannel2::*ModelPointer) (
-		const std::vector<float_4>&, const std::vector<float_4>&, 
-		const std::vector<float_4>&, const std::vector<float_4>&,
-		const std::vector<float_4>&, const std::vector<float_4>&,
-		std::vector<float_4>&, std::vector<float_4>&, 
-		std::vector<float_4>&, std::vector<float_4>&,
-		const float&, const float&,
-		float&, float&);
-
-	ModelPointer modelPointer;
 
     float pos_in_L = 0.0;
     float pos_in_R = 0.0;
@@ -140,20 +72,6 @@ struct WaveChannel2 {
 	bool additive_mode_L = true;
 	bool additive_mode_R = true;
 
-	std::vector<float_4> v_a0 = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
-	std::vector<float_4> v_b0 = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
-	std::vector<float_4> v_a1 = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
-	std::vector<float_4> v_b1 = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
-	//special dc bias cancelling vectors
-	std::vector<float_4> v_dc_a = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
-	std::vector<float_4> v_dc_b = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
-
-	// temporaries for the model update steps. decreases overhead by declaring them in this scope
-	std::vector<float_4> t_gradient_a = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
-	std::vector<float_4> t_gradient_b = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
-	std::vector<float_4> t_laplacian_a = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
-	std::vector<float_4> t_laplacian_b = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
-
 	// weights for the input and output probes, generated whenever the respective probe settings change
 	std::vector<float_4> input_probe_L_window = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
 	std::vector<float_4> input_probe_R_window = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
@@ -169,15 +87,6 @@ struct WaveChannel2 {
 
 	WaveChannel2() {
 		model = Model::WAVE_EQUATION;
-		modelPointer = &WaveChannel2::stepWaveEquation;
-		//const float biquad_cutoff = 0.125f;
-		const float biquad_cutoff = 0.0625f;
-		const float biquad_Q = 0.5f;
-		const float biquad_gain = 1.0f;
-		biquad_input_L.setParameters(dsp::BiquadFilter::Type::LOWPASS,  biquad_cutoff, biquad_Q, biquad_gain);
-		biquad_input_R.setParameters(dsp::BiquadFilter::Type::LOWPASS,  biquad_cutoff, biquad_Q, biquad_gain);
-		biquad_output_L.setParameters(dsp::BiquadFilter::Type::LOWPASS, biquad_cutoff, biquad_Q, biquad_gain);
-		biquad_output_R.setParameters(dsp::BiquadFilter::Type::LOWPASS, biquad_cutoff, biquad_Q, biquad_gain);
 	}
 
     // TODO: will decide later on if I want to do 1D or 2D buffers throughout.
@@ -248,23 +157,6 @@ struct WaveChannel2 {
 		return sgn1 * sgn2 * sgn3 * abs_min;
 	}
 
-	// Variation on smoothstep with the max value of the first derivative always <= 1.0
-	// This clamps without also amplifying the signal.
-	inline float_4 smoothclamp(float_4 x, float_4 low, float_4 high) {
-		x = (2./3.) * x;
-		x = simd::clamp((x - low) / (high - low), 0., 1.);
-		return simd::rescale(x*x*(3. - 2.*x),0.,1.,low,high);
-	}
-
-	// Variation on smoothstep with the max value of the first derivative always <= 1.0
-	// This clamps without also amplifying the signal.
-    // TODO: it's nice that this is pretty fast, but I think a nicer-sounding alternative is feasible
-	inline float smoothclamp(float x, float low, float high) {
-		x = (2./3.) * x;
-		x = simd::clamp((x - low) / (high - low), 0., 1.);
-		return simd::rescale(x*x*(3. - 2.*x),0.,1.,low,high);
-	}
-
 	/** computes a gaussian using the differences of the (approximate) error function
 	 *  this is a much better approach than simply sampling a gaussian because we can
 	 *  almost eliminate aliasing, even at small kernel sizes
@@ -315,415 +207,6 @@ struct WaveChannel2 {
 		float_4 snc = simd::sin(x_s2)/x_s2;
 		float_4 almost_zero = simd::abs(x_s2) < 1.0e-6f;
 		return simd::ifelse(almost_zero, 1.0, snc);
-	}
-
-	
-	/** We need to compute the gradient and laplacian of two float_4 
-	 * 	buffers several times here, so we need to do it as fast as possible.
-	 * 	To do this, each float_4 buffer is circular shifted by one float to
-	 *  the left and one float to the right to get the left and right
-	 *  neighbors needed for the calculation aligned into float_4s.
-	 *  We use hardware shuffle intrinsics to swizzle _m128 float vectors
-	 *  to get left-shifted and right-shifted vectors. After this point,
-	 *  we can do our simple calculations using SIMD ops.
-	*/
-    /*
-        TODO: let's do templating here so we can create
-         function specializations that only compute the derivatives needed.
-         This should open up the possibility for more models as well.
-        TODO: if we make the laplacian kernel weights modifiable, the structure
-         of the kernel weight data has big performance implications.
-         At the moment the most sensible thing seems to be to have separate arrays
-         of float_4s for N,S,E,W cardinal directions, although that does necessitate shuffling
-         them in the same way we do values.
-     */
-	#define INDEX_MASK_X static_cast<unsigned int>(CHANNEL_MASK_X)
-    #define INDEX_MASK_Y static_cast<unsigned int>(CHANNEL_MASK_Y)
-    // can these be simplified?
-    #define INDEX_Y_BASE (index / CHANNEL_SIZE_X)
-    #define INDEX_X_BASE (index & INDEX_MASK_X)
-	#define INDEX_X_MINUS_1 (INDEX_Y_BASE * CHANNEL_SIZE_X + ((index-1) & INDEX_MASK_X))
-	#define INDEX_X_PLUS_1 (INDEX_Y_BASE * CHANNEL_SIZE_X + ((index+1) & INDEX_MASK_X))
-    #define INDEX_Y_MINUS_1 (((INDEX_Y_BASE-1) & INDEX_MASK_Y) * CHANNEL_SIZE_X + INDEX_X_BASE)
-    #define INDEX_Y_PLUS_1 (((INDEX_Y_BASE+1) & INDEX_MASK_Y) * CHANNEL_SIZE_X + INDEX_X_BASE)
-
-    #ifdef __APPLE__
-        typedef float v4sf __attribute__((__vector_size__(16)));
-        typedef int v4si __attribute__((__vector_size__(16)));
-    #else
-        typedef float v4sf __attribute__ ((vector_size (16)));
-        typedef int v4si __attribute__ ((vector_size (16)));
-        const v4si mask_l = {1,2,3,4};
-        const v4si mask_r = {3,4,5,6};
-    #endif
-    #define V4SF_TO_FLOAT_4(v) float_4(reinterpret_cast<__m128>(v))
-    #define FLOAT_4_TO_V4SF(f) reinterpret_cast<v4sf>(f.v)
-    inline void gradient_and_laplacian(const std::vector<float_4> &x, std::vector<float_4> &grad_out, std::vector<float_4> &lapl_out) {
-        for (unsigned int index = 0; index < CHANNEL_SIZE; index++) {
-            v4sf e = FLOAT_4_TO_V4SF(x[INDEX_X_PLUS_1]);
-            v4sf w = FLOAT_4_TO_V4SF(x[INDEX_X_MINUS_1]);
-            v4sf n = FLOAT_4_TO_V4SF(x[INDEX_Y_PLUS_1]);
-            v4sf s = FLOAT_4_TO_V4SF(x[INDEX_Y_MINUS_1]);
-            v4sf c = FLOAT_4_TO_V4SF(x[index]);
-
-            #ifdef __APPLE__
-                float_4 shuffle_l = V4SF_TO_FLOAT_4(__builtin_shufflevector(c, e, 1, 2, 3, 4));
-                float_4 shuffle_r = V4SF_TO_FLOAT_4(__builtin_shufflevector(w, c, 3, 4, 5, 6));
-            #else
-                float_4 shuffle_l = V4SF_TO_FLOAT_4(__builtin_shuffle(c, e, mask_l));
-                float_4 shuffle_r = V4SF_TO_FLOAT_4(__builtin_shuffle(w, c, mask_r));
-            #endif
-            // TODO: change function sig for separate xy gradients
-            grad_out[index] = (shuffle_l - shuffle_r) / 2.0;
-
-            lapl_out[index] =
-                      kernel_weight_N[index] * n
-                    + kernel_weight_S[index] * s
-                    + kernel_weight_E[index] * shuffle_l // are E and W correct here?
-                    + kernel_weight_W[index] * shuffle_r
-                    + kernel_weight_C[index] * x[index];
-        }
-    }
-
-
-	/** Temporaries for RK4 integration. Declaring them in function scope incurs a huge
-	 *  overhead cost. Some of these (the _half_ vectors) could be reused, but it's not much
-	 *  memory and doing so would make the code significantly more confusing.
-	 */
-    // TODO: can we generalize this for a greater number of model parameters without trashing performance?
-	std::vector<float_4> a_grad_1 = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
-	std::vector<float_4> a_half_2 = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
-	std::vector<float_4> a_grad_2 = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
-	std::vector<float_4> a_half_3 = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
-	std::vector<float_4> a_grad_3 = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
-	std::vector<float_4> a_half_4 = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
-	std::vector<float_4> a_grad_4 = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
-
-	std::vector<float_4> b_grad_1 = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
-	std::vector<float_4> b_half_2 = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
-	std::vector<float_4> b_grad_2 = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
-	std::vector<float_4> b_half_3 = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
-	std::vector<float_4> b_grad_3 = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
-	std::vector<float_4> b_half_4 = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
-	std::vector<float_4> b_grad_4 = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
-
-	#define I_CLAMP clip_range
-	#define F_CLAMP clip_range
-	#define INTER_CLAMP(x) smoothclamp((x),-I_CLAMP,I_CLAMP)
-	#define FINAL_CLAMP(x) smoothclamp((x),-F_CLAMP,F_CLAMP)
-
-	float t_amp_in_prev_L = 0.0f;
-	float t_amp_in_prev_R = 0.0f;
-	
-	
-	inline void processInputSample(float &input_L, float &input_R, const float &feedback_amp_L, const float &feedback_amp_R, int iter) {
-		float t_amp_in_L, t_amp_in_R;
-		if (oversampling_mode == OversamplingMode::OVERSAMPLE_SINC) {
-			if (iter == 0) {
-				upsampler_input_L.process(input_L, upsampler_result_input_L);
-				upsampler_input_R.process(input_R, upsampler_result_input_R);
-			}
-			t_amp_in_L = upsampler_result_input_L[iter];
-			t_amp_in_R = upsampler_result_input_R[iter];
-		} else {
-			t_amp_in_L = biquad_input_L.process(input_L);
-			t_amp_in_R = biquad_input_R.process(input_R);
-		}
-
-		// no really special reason for this, but squid axon rapidly squashes
-		// inputs, so it can take more feedback
-		if (model == WaveChannel2::SQUID_AXON) {
-			input_L = feedback * 4.0 * INTER_CLAMP(0.25 * feedback_amp_L) + t_amp_in_L;
-			input_R = feedback * 4.0 * INTER_CLAMP(0.25 * feedback_amp_R) + t_amp_in_R;
-		} else {
-			input_L = feedback * INTER_CLAMP(0.25 * feedback_amp_L) + t_amp_in_L;
-			input_R = feedback * INTER_CLAMP(0.25 * feedback_amp_R) + t_amp_in_R;
-		}
-
-	}
-
-	inline void processOutputSample(float &sample_L, float &sample_R, int iter) {
-		if (oversampling_mode == OversamplingMode::OVERSAMPLE_SINC) {
-			decimator_input_L[iter] = sample_L;
-			decimator_input_R[iter] = sample_R;
-		} else {
-			sample_L = biquad_output_L.process(sample_L);
-			sample_R = biquad_output_R.process(sample_R);
-		}
-	}
-
-	inline void modelIteration(
-			const std::vector<float_4> &a_in, std::vector<float_4> &delta_a,
-			const std::vector<float_4> &b_in, std::vector<float_4> &delta_b,
-			float input_L, float input_R, 
-			float &t_amp_out_L, float &t_amp_out_R,
-			int iter) {
-
-		processInputSample(input_L, input_R, t_amp_out_L, t_amp_out_R, iter);
-
-		gradient_and_laplacian(a_in, t_gradient_a, t_laplacian_a);
-		gradient_and_laplacian(b_in, t_gradient_b, t_laplacian_b);
-		(this->*modelPointer)(a_in, b_in, t_laplacian_a, t_laplacian_b, 
-		t_gradient_a, t_gradient_b, delta_a, delta_b, v_dc_a, v_dc_b,
-		input_L, input_R, t_amp_out_L, t_amp_out_R);
-
-		processOutputSample(t_amp_out_L, t_amp_out_R, iter);
-	}
-
-	/** Runge-Kutta (RK4) integration,
-	 *  Using the 3/8s Runge Kutta method.
-	 *  Used to increase stability at large timesteps
-	 *  and also to upsample our input.
-	 *  TODO: if I figure out how to claw back some performance elsewhere, consider
-	 *   using a higher-order method here. Implicit solvers are probably off the table though
-	 *  TODO: consider instead using a two multidimensional vectors (for ping ponging)
-     *   so we can expand the number of parameters more freely
-	 */
-	void RK4_iter_3_8s(
-			const std::vector<float_4> &a0, const std::vector<float_4> &b0, 
-			std::vector<float_4> &a1, std::vector<float_4> &b1) {
-
-		const float third = 1.0/3.0;
-
-		// Round 1, initial step
-		modelIteration( a0, a_grad_1, b0, b_grad_1, 
-				amp_in_L - low_cut * amp_in_prev_L, 
-				amp_in_R - low_cut * amp_in_prev_R, 
-				amp_out_L, amp_out_R, 0);
-
-		for (int i = 0; i < CHANNEL_SIZE; i++) {
-			INTER_CLAMP(a_half_2[i] = a0[i] + third * timestep * a_grad_1[i]);
-			INTER_CLAMP(b_half_2[i] = b0[i] + third * timestep * b_grad_1[i]);
-		}
-
-		// Round 2, 1/3 step
-		// input is only non-zero on the first round for upsampling
-        // TODO: let's do lagrange interpolation instead
-		modelIteration( a_half_2, a_grad_2, b_half_2, b_grad_2, 0.f, 0.f, amp_out_L, amp_out_R, 1);
-
-		for (int i = 0; i < CHANNEL_SIZE; i++) {
-			INTER_CLAMP(a_half_3[i] = a0[i] + timestep * (-third * a_grad_1[i] + a_grad_2[i]));
-			INTER_CLAMP(b_half_3[i] = b0[i] + timestep * (-third * b_grad_1[i] + b_grad_2[i]));
-		}
-
-		// Round 3, 2/3 step
-		modelIteration( a_half_3, a_grad_3, b_half_3, b_grad_3, 0.f, 0.f, amp_out_L, amp_out_R, 2);
-
-		for (int i = 0; i < CHANNEL_SIZE; i++) {
-			INTER_CLAMP(a_half_4[i] = a0[i] + timestep * (a_grad_1[i] - a_grad_2[i] + a_grad_3[i]));
-			INTER_CLAMP(b_half_4[i] = b0[i] + timestep * (b_grad_1[i] - b_grad_2[i] + b_grad_3[i]));
-		}
-
-		// Round 4, whole step
-		modelIteration( a_half_4, a_grad_4, b_half_4, b_grad_4, 0.f, 0.f, amp_out_L, amp_out_R, 3);
-
-		for (int i = 0; i < CHANNEL_SIZE; i++) {
-			//final result
-			//clamping isn't a part of RK4, but it's more convenient to do it here than elsewhere
-			a1[i] = FINAL_CLAMP(a0[i] + timestep * (a_grad_1[i] + 3.0f * a_grad_2[i] + 3.0f * a_grad_3[i] + a_grad_4[i]) / 8.0f);
-			b1[i] = FINAL_CLAMP(b0[i] + timestep * (b_grad_1[i] + 3.0f * b_grad_2[i] + 3.0f * b_grad_3[i] + b_grad_4[i]) / 8.0f);
-		}
-
-		// clamp to prevent blowups, but with a large range to avoid clipping in general
-		if (oversampling_mode == OversamplingMode::OVERSAMPLE_SINC) {
-			amp_out_L = math::clamp(decimator_output_L.process(decimator_input_L), -100.0f, 100.0f);
-			amp_out_R = math::clamp(decimator_output_R.process(decimator_input_R), -100.0f, 100.0f);
-		} else {
-			amp_out_L = math::clamp(amp_out_L,-100.0f,100.0f);
-			amp_out_R = math::clamp(amp_out_R,-100.0f,100.0f);
-		}
-
-	}
-
-	float sum(float_4 x) {
-		return x[0] + x[1] + x[2] + x[3];
-	}
-
-	/* for stability, the coefficient for laplacian components
-		should always work out to be <= 0.5. 
-		(This limit is complicated somewhat when using RK4, 
-		but holds for euler integration and our laplacian stencil. 
-		RK4 raises the limit however, so 0.5 is a safe assumption)
-	    TODO: do a more complete stability analysis and update this for the
-	     larger laplacian norm from 2D
-	*/
-	inline float getSafeTimestep() {
-		return std::min(1.0f, 1.0f/(2.0f*timestep));
-	}
-
-    // TODO: I think the multiplicative mode doesn't bring much to the table and can be removed
-	void stepWaveEquation(
-		const std::vector<float_4> &a0, const std::vector<float_4> &b0, 
-		const std::vector<float_4> &laplacian_a, const std::vector<float_4> &laplacian_b,
-		const std::vector<float_4> &gradient_a, const std::vector<float_4> &gradient_b,
-		std::vector<float_4> &delta_a, std::vector<float_4> &delta_b,
-		std::vector<float_4> &dc_bias_a, std::vector<float_4> &dc_bias_b,
-		const float &t_input_L, const float &t_input_R,
-		float &t_amp_out_L, float &t_amp_out_R) {
-		
-		float_4 probe_out_L = float_4(0.0);
-		float_4 probe_out_R = float_4(0.0);
-
-		float safe_timestep = getSafeTimestep();
-
-		for (int i = 0; i < CHANNEL_SIZE; i++) {
-			float_4 probe_in_L = t_input_L * input_probe_L_window[i];
-			float_4 probe_in_R = t_input_R * input_probe_R_window[i];
-
-			float_4 a = a0[i];
-			float_4 b = b0[i];
-
-			probe_out_L += a * output_probe_L_window[i];
-			probe_out_R += a * output_probe_R_window[i];
-			float_4 summed_probe_input = 
-					(additive_mode_L ? probe_in_L : (a * probe_in_L)) + 
-					(additive_mode_R ? probe_in_R : (a * probe_in_R));
-
-			delta_a[i] = (summed_probe_input + b + safe_timestep * damping * laplacian_a[i] - decay * a - dc_bias_a[i]);
-			delta_b[i] = (laplacian_a[i] - decay * b - dc_bias_b[i]);
-
-			dc_bias_a[i] = simd::crossfade(a, dc_bias_a[i],0.9995);
-			dc_bias_b[i] = simd::crossfade(b, dc_bias_b[i],0.9995);
-
-		}
-
-		t_amp_out_L = sum(probe_out_L);
-		t_amp_out_R = sum(probe_out_R);
-	}
-
-	void stepSquidAxon(
-		const std::vector<float_4> &a0, const std::vector<float_4> &b0, 
-		const std::vector<float_4> &laplacian_a, const std::vector<float_4> &laplacian_b,
-		const std::vector<float_4> &gradient_a, const std::vector<float_4> &gradient_b,
-		std::vector<float_4> &delta_a, std::vector<float_4> &delta_b,
-		std::vector<float_4> &dc_bias_a, std::vector<float_4> &dc_bias_b,
-		const float &t_input_L, const float &t_input_R,
-		float &t_amp_out_L, float &t_amp_out_R) {
-
-		float_4 probe_out_L = float_4(0.0);
-		float_4 probe_out_R = float_4(0.0);
-
-		float safe_timestep = getSafeTimestep();
-
-		// Squid axon params
-		float k1 = 1.0-decay;
-		const float k2 = 0.0;
-		const float k3 = 1.0;
-		const float k4 = 1.0;
-		const float epsilon = 0.1;
-		float delta = safe_timestep * damping;
-		const float ak0 = -0.1;
-		const float ak1 = 2.0;
-
-		for (int i = 0; i < CHANNEL_SIZE; i++) {
-			float_4 probe_in_L = t_input_L * input_probe_L_window[i];
-			float_4 probe_in_R = t_input_R * input_probe_R_window[i];
-
-			float_4 a = simd::clamp(a0[i],-2.0f,2.0f);
-			float_4 b = simd::clamp(b0[i],-2.0f,2.0f);
-
-			probe_out_L += a * output_probe_L_window[i];
-			probe_out_R += a * output_probe_R_window[i];
-
-			float_4 summed_probe_input_a = 
-					(additive_mode_L ? probe_in_L : (a * probe_in_L)) + 
-					(additive_mode_R ? probe_in_R : (a * probe_in_R));
-			float_4 summed_probe_input_b = 
-					(additive_mode_L ? probe_in_L : (b * probe_in_L)) + 
-					(additive_mode_R ? probe_in_R : (b * probe_in_R));
-			delta_a[i] = summed_probe_input_a + k1*a - k2*a*a - k4*a*a*a - b + safe_timestep * laplacian_a[i];
-			delta_b[i] = - summed_probe_input_b + epsilon*(k3*a - ak1*b - ak0) + delta*laplacian_b[i];
-		}
-
-		t_amp_out_L = sum(probe_out_L);
-		t_amp_out_R = sum(probe_out_R);
-	}
-
-	void stepSchrodinger(
-		const std::vector<float_4> &a0, const std::vector<float_4> &b0, 
-		const std::vector<float_4> &laplacian_a, const std::vector<float_4> &laplacian_b,
-		const std::vector<float_4> &gradient_a, const std::vector<float_4> &gradient_b,
-		std::vector<float_4> &delta_a, std::vector<float_4> &delta_b,
-		std::vector<float_4> &dc_bias_a, std::vector<float_4> &dc_bias_b,
-		const float &t_input_L, const float &t_input_R,
-		float &t_amp_out_L, float &t_amp_out_R) {
-				  			
-		float_4 probe_out_L = float_4(0.0);
-		float_4 probe_out_R = float_4(0.0);
-
-		float safe_timestep = getSafeTimestep();
-
-		for (int i = 0; i < CHANNEL_SIZE; i++) {
-			float_4 probe_in_L = t_input_L * input_probe_L_window[i];
-			float_4 probe_in_R = t_input_R * input_probe_R_window[i];
-
-			float_4 a = a0[i];
-			float_4 b = b0[i];
-
-			probe_out_L += a * output_probe_L_window[i];
-			probe_out_R += a * output_probe_R_window[i];
-
-			float_4 summed_probe_input_a = 
-					(additive_mode_L ? probe_in_L : (a * probe_in_L)) + 
-					(additive_mode_R ? probe_in_R : (a * probe_in_R));
-			float_4 summed_probe_input_b = 
-					(additive_mode_L ? probe_in_L : (b * probe_in_L)) + 
-					(additive_mode_R ? probe_in_R : (b * probe_in_R));
-			// Schrodinger equation, with added diffusion and decay
-			// "multiplicative mode" should be considered the physically correct default here
-			delta_a[i] =  (-summed_probe_input_a + - laplacian_b[i] - decay * a + safe_timestep * damping * laplacian_a[i]);
-			delta_b[i] = ( summed_probe_input_b + laplacian_a[i] - decay * b + safe_timestep * damping * laplacian_b[i]);
-		}
-
-		t_amp_out_L = sum(probe_out_L);
-		t_amp_out_R = sum(probe_out_R);
-	}
-
-    // TODO: will need x and y gradients
-	void stepRK4Advection(		
-		const std::vector<float_4> &a0, const std::vector<float_4> &b0, 
-		const std::vector<float_4> &laplacian_a, const std::vector<float_4> &laplacian_b,
-		const std::vector<float_4> &gradient_a, const std::vector<float_4> &gradient_b,
-		std::vector<float_4> &delta_a, std::vector<float_4> &delta_b,
-		std::vector<float_4> &dc_bias_a, std::vector<float_4> &dc_bias_b,
-		const float &t_input_L, const float &t_input_R,
-		float &t_amp_out_L, float &t_amp_out_R) {
-			
-		float_4 probe_out_L = float_4(0.0);
-		float_4 probe_out_R = float_4(0.0);
-
-		float_4 probe_in_R = simd::rescale(t_input_R,-10.0,10.0,-1.0,1.0);
-		float pos_to_mod_offset = 2.0*(pos_in_R - (MAX_POSITION / 2.0)) / MAX_POSITION;
-		probe_in_R = sig_in_R * (probe_in_R + pos_to_mod_offset);
-
-		float safe_timestep = getSafeTimestep();
-
-		for (int i = 0; i < CHANNEL_SIZE; i++) {
-			float_4 probe_in_L = t_input_L * input_probe_L_window[i];
-			
-			float_4 a = a0[i];
-
-			probe_out_L += a * output_probe_L_window[i];
-			probe_out_R += a * output_probe_R_window[i];
-
-			// additive mode necessarily works differently here
-			float_4 summed_probe_input_a = 
-					(additive_mode_L ? probe_in_L : (a * probe_in_L));
-			
-			// no multiplicative mode here for right probe, not because 
-			// we can't do it, but because it's incredibly unstable
-			//float_4 summed_probe_input_b = 
-			//		(additive_mode_R ? probe_in_R : (a * probe_in_R));
-
-			// gradients are smoothclamped for stability
-            // TODO: evaluate whether a better gradient clipping scheme might sound better
-			delta_a[i] = smoothclamp((summed_probe_input_a + safe_timestep * damping * laplacian_a[i] - decay * a)  // input
-					- probe_in_R * gradient_a[i], -10.0f, 10.0f); // advection
-
-		}
-
-		t_amp_out_L = sum(probe_out_L);
-		t_amp_out_R = sum(probe_out_R);
 	}
 
 	void setParams(float damping, float timestep, float decay, float low_cut, float feedback) {
@@ -920,7 +403,6 @@ struct WaveChannel2 {
 		generateProbeWindow(output_probe_R_window, true, this->pos_out_R, this->sig_out_R, output_probe_type_R);
 	}
 
-
 	void setProbeInputs(float amp_in_L, float amp_in_R) {
 		this->amp_in_prev_L = this->amp_in_L;
 		this->amp_in_prev_R = this->amp_in_R;
@@ -941,24 +423,6 @@ struct WaveChannel2 {
 				break;
 			case RK4_ADVECTION:
 				this->model = Model::WAVE_EQUATION;
-				break;
-		}
-		setModelPointer();
-	}
-
-	void setModelPointer() {
-		switch(this->model) {
-			case SQUID_AXON:
-				this->modelPointer = &WaveChannel2::stepSquidAxon;
-				break;
-			case SCHRODINGER:
-				this->modelPointer = &WaveChannel2::stepSchrodinger;
-				break;
-			case RK4_ADVECTION:
-				this->modelPointer = &WaveChannel2::stepRK4Advection;
-				break;
-			case WAVE_EQUATION:
-				this->modelPointer = &WaveChannel2::stepWaveEquation;
 				break;
 		}
 	}
@@ -1017,18 +481,38 @@ struct WaveChannel2 {
 		}
 	}
 
+    ModelIter_Data<2, CHANNEL_SIZE> dataPing;
+    ModelIter_Data<2, CHANNEL_SIZE> dataPong = dataPing.create_swapped_copy();
+    ModelParams<CHANNEL_SIZE> modelParams;
+
 	// Update the ping-pong buffers
 	void update() {
 		setClipRange();
-		setModelPointer();
-		if (pong) {
-			RK4_iter_3_8s(v_a0, v_b0, v_a1, v_b1);
-		} else {
-			RK4_iter_3_8s(v_a1, v_b1, v_a0, v_b0);
-		}
+		//setModelPointer();
+        ModelIter_Data<2, CHANNEL_SIZE>* data;
+        if (pong) {
+            data = &dataPing;
+        } else {
+            data = &dataPong;
+        }
+
+        switch(this->model) {
+            case SQUID_AXON:
+                RK4_iter_3_8s<2, CHANNEL_SIZE, stepSquidAxon<2, CHANNEL_SIZE>>(*data, modelParams);
+                break;
+            case SCHRODINGER:
+                RK4_iter_3_8s<2, CHANNEL_SIZE, stepSchrodinger<2, CHANNEL_SIZE>>(*data, modelParams);
+                break;
+            case RK4_ADVECTION:
+                RK4_iter_3_8s<2, CHANNEL_SIZE, stepRK4Advection<2, CHANNEL_SIZE>>(*data, modelParams);
+                break;
+            case WAVE_EQUATION:
+                RK4_iter_3_8s<2, CHANNEL_SIZE, stepWaveEquation<2, CHANNEL_SIZE>>(*data, modelParams);
+                break;
+        }
+
 		pong = !pong;
 	}
-
 };
 
 struct WaterTable2 : Module {

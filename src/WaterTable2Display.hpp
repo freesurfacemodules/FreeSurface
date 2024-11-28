@@ -490,7 +490,8 @@ struct WaterTable2Display : TransparentWidget {
             #ifdef DEBUG_PROBE_WEIGHT
 			    history.push_back(module->waveChannel.input_probe_L_window);
             #else
-                history.push_back(module->waveChannel.v_a0);
+                // TODO: ugly and bad
+                history.push_back(std::vector<float_4>(module->waveChannel.dataPing.outputs[0].begin(),module->waveChannel.dataPing.outputs[0].end()));
             #endif
 			history.pop_front();
 

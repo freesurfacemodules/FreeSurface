@@ -1,0 +1,22 @@
+#ifndef FREESURFACE_WATERTABLE2CONSTANTS_H
+#define FREESURFACE_WATERTABLE2CONSTANTS_H
+    // 2^30 * ln(2)
+    #define EXP2_30_TO_EXP 744261117.954893018
+    #define ONE_OVER_SQRT_TWO_PI 0.3989422804
+    #define SQRT_2 1.41421356237
+
+    // must be power-of-two
+    #define CHANNEL_SIZE 16
+    // 2 float4s, packed on x axis for a 8x8 grid
+    #define CHANNEL_SIZE_X 2
+    #define CHANNEL_SIZE_X_FLOATS 8
+    #define CHANNEL_SIZE_Y 8
+    #define CHANNEL_SIZE_FLOATS (CHANNEL_SIZE << 2)
+    #define CHANNEL_MASK (CHANNEL_SIZE - 1)
+
+    #define MAX_POSITION (CHANNEL_SIZE * 4.0)
+
+    #define CHANNEL_MASK_X (CHANNEL_SIZE_X - 1)
+    #define CHANNEL_MASK_X_FLOATS (CHANNEL_SIZE_X_FLOATS - 1)
+    #define CHANNEL_MASK_Y (CHANNEL_SIZE_Y - 1)
+#endif //FREESURFACE_WATERTABLE2CONSTANTS_H
