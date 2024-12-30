@@ -12,3 +12,7 @@
 plugin-dev.json
 libsamplerate-0.1.9.tar.gz
 workspace.code-workspace
+/.cache
+/.idea
+compile_commands.json
+launchrack.sh

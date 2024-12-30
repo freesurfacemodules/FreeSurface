@@ -23,6 +23,18 @@
       "name": "WaterTable2",
       "description": "Physical modeling system with a fully analog design",
       "tags": ["Distortion", "Filter", "Panning", "Ring modulator", "Physical modeling"]
+    },
+    {
+      "slug": "FreeSurface-StereoToMonoFFT",
+      "name": "SpectralStereo",
+      "description": "Physical modeling system with a fully analog design",
+      "tags": ["Distortion", "Filter", "Panning", "Ring modulator", "Physical modeling"]
+    },
+    {
+      "slug": "FreeSurface-FirstCompressor",
+      "name": "FirstCompressor",
+      "description": "Physical modeling system with a fully analog design",
+      "tags": ["Distortion", "Filter", "Panning", "Ring modulator", "Physical modeling"]
     }
   ]
 }

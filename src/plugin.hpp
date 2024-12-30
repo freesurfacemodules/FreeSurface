@@ -15,4 +15,6 @@ extern Plugin* pluginInstance;
 extern Model* modelWaterTable;
 extern Model* modelWaterTable2;
 //extern Model* modelAliasFreeDistortion;
+extern Model* modelStereoToMonoFFT;
+extern Model* modelFirstCompressor;
 

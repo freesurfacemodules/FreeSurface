@@ -38,7 +38,7 @@ struct WaterTable2Display : TransparentWidget {
 	float halo_brightness = 0.5;
 
 	const int HISTORY_SIZE = 16;
-	std::deque<std::vector<float_4>> history;
+	std::deque<std::array<float_4, CHANNEL_SIZE>> history;
 	std::string fontPath;
 
 
@@ -51,8 +51,11 @@ struct WaterTable2Display : TransparentWidget {
 	}
 
 	WaterTable2Display() :
-			history(HISTORY_SIZE, std::vector<float_4>(CHANNEL_SIZE, float_4::zero())),
-			fontPath(asset::plugin(pluginInstance, "res/fixedsys-excelsior-301.ttf")) {}
+			fontPath(asset::plugin(pluginInstance, "res/fixedsys-excelsior-301.ttf")) {
+        std::array<float_4, CHANNEL_SIZE> zeroes;
+        zeroes.fill(float_4::zero());
+        history = std::deque<std::array<float_4, CHANNEL_SIZE>>(HISTORY_SIZE, zeroes);
+    }
 
 	void setBBox() {
 		b = Rect(Vec(0, 0), box.size);
@@ -92,20 +95,20 @@ struct WaterTable2Display : TransparentWidget {
 		return scaleToBoxByX(v);
 	}
 
-	float scaledBufferFromIndex(std::vector<float_4> &buffer, int i) {
+	float scaledBufferFromIndex(std::array<float_4, CHANNEL_SIZE> &buffer, int i) {
 		int f_in = i % 4;
 		int f4_in = i / 4;
 		return -rescale(buffer[f4_in][f_in],-10.0,10.0,-1.0,1.0);
 	}
 
-    float scaledBufferFromXY(std::vector<float_4> &buffer, unsigned int i, unsigned int j, unsigned int channel_size_x, unsigned int channel_size_y) {
+    float scaledBufferFromXY(std::array<float_4, CHANNEL_SIZE> &buffer, unsigned int i, unsigned int j, unsigned int channel_size_x, unsigned int channel_size_y) {
         int channel_size_f4 = channel_size_x / 4;
         int f_in = i % 4;
         int f4_in = i / 4;
         return -rescale(buffer[f4_in + j * channel_size_f4][f_in],-10.0,10.0,-1.0,1.0);
     }
 
-	void drawWaveform(const DrawArgs& args, std::vector<float_4> &buffer, int index, const NVGpaint& p, bool halo) {
+	void drawWaveform(const DrawArgs& args, std::array<float_4, CHANNEL_SIZE> &buffer, int index, const NVGpaint& p, bool halo) {
 		float step = static_cast<float>(index) / static_cast<float>(HISTORY_SIZE-1);
         const float alpha_scale = 1.0;
         float alpha = alpha_scale*simd::pow(step, 2.0);
@@ -114,7 +117,7 @@ struct WaterTable2Display : TransparentWidget {
         #ifdef DEBUG_PROBE_WEIGHT
             const float displacement = 10.0f;
         #else
-            const float displacement = 20.0f;
+            const float displacement = 5.0f;
         #endif
 
         // -1 because we plot two points per iteration
@@ -490,8 +493,7 @@ struct WaterTable2Display : TransparentWidget {
             #ifdef DEBUG_PROBE_WEIGHT
 			    history.push_back(module->waveChannel.input_probe_L_window);
             #else
-                // TODO: ugly and bad
-                history.push_back(std::vector<float_4>(module->waveChannel.dataPing.outputs[0].begin(),module->waveChannel.dataPing.outputs[0].end()));
+                history.push_back(std::array<float_4, CHANNEL_SIZE>(module->waveChannel.displayData));
             #endif
 			history.pop_front();
 

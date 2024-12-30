@@ -2,18 +2,20 @@
 #include "OpCache.hpp"
 //#include "Profiler.hpp"
 #include <cmath>
-#include <cstring>
+//#include <cstring>
 #include "Integrator.h"
-
-using simd::float_4;
-using simd::int32_4;
+#include <iomanip> //just for debugging
 
 struct WaveChannel2 {
 	enum Model {
 		WAVE_EQUATION,
 		SQUID_AXON,
 		SCHRODINGER,
-		RK4_ADVECTION
+		RK4_ADVECTION,
+        SHALLOW_WATER,
+        YANG_JUMPING,
+        EULER_COMPRESSIBLE,
+        NUM_MODELS
 	};
 
 	Model model;
@@ -62,9 +64,6 @@ struct WaveChannel2 {
     float low_cut = 0.0;
     float anisotropy = 0.0;
 
-	// ping pong buffer setup
-	bool pong = false;
-
 	ProbeType input_probe_type_L = ProbeType::INTEGRAL;
 	ProbeType input_probe_type_R = ProbeType::INTEGRAL;
 	ProbeType output_probe_type_L = ProbeType::INTEGRAL;
@@ -73,17 +72,17 @@ struct WaveChannel2 {
 	bool additive_mode_R = true;
 
 	// weights for the input and output probes, generated whenever the respective probe settings change
-	std::vector<float_4> input_probe_L_window = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
-	std::vector<float_4> input_probe_R_window = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
-	std::vector<float_4> output_probe_L_window = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
-	std::vector<float_4> output_probe_R_window = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
+	//std::vector<float_4> input_probe_L_window = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
+	//std::vector<float_4> input_probe_R_window = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
+	//std::vector<float_4> output_probe_L_window = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
+	//std::vector<float_4> output_probe_R_window = std::vector<float_4>(CHANNEL_SIZE, float_4::zero());
 
     // kernel weights
-    std::vector<float_4> kernel_weight_N = std::vector<float_4>(CHANNEL_SIZE, float_4(1.));
-    std::vector<float_4> kernel_weight_E = std::vector<float_4>(CHANNEL_SIZE, float_4(1.));
-    std::vector<float_4> kernel_weight_S = std::vector<float_4>(CHANNEL_SIZE, float_4(1.));
-    std::vector<float_4> kernel_weight_W = std::vector<float_4>(CHANNEL_SIZE, float_4(1.));
-    std::vector<float_4> kernel_weight_C = std::vector<float_4>(CHANNEL_SIZE, float_4(-4.));
+    //std::vector<float_4> kernel_weight_N = std::vector<float_4>(CHANNEL_SIZE, float_4(1.));
+    //std::vector<float_4> kernel_weight_E = std::vector<float_4>(CHANNEL_SIZE, float_4(1.));
+    //std::vector<float_4> kernel_weight_S = std::vector<float_4>(CHANNEL_SIZE, float_4(1.));
+    //std::vector<float_4> kernel_weight_W = std::vector<float_4>(CHANNEL_SIZE, float_4(1.));
+    //std::vector<float_4> kernel_weight_C = std::vector<float_4>(CHANNEL_SIZE, float_4(-4.));
 
 	WaveChannel2() {
 		model = Model::WAVE_EQUATION;
@@ -93,29 +92,29 @@ struct WaveChannel2 {
     //  in the latter case this function should not be needed
     // This works with unpacked float indices and is used for computing positions
     // rather than indexing into a buffer
-    inline void indexToPosFloats(unsigned int index, unsigned int &x, unsigned int &y) {
+    static inline void indexToPosFloats(unsigned int index, unsigned int &x, unsigned int &y) {
         x = index & CHANNEL_MASK_X_FLOATS;
         y = index / CHANNEL_SIZE_X_FLOATS;
     }
 
-    inline void indexToPos(unsigned int index, unsigned int &x, unsigned int &y) {
+    static inline void indexToPos(unsigned int index, unsigned int &x, unsigned int &y) {
         x = index & CHANNEL_MASK_X;
         y = index / CHANNEL_SIZE_X;
     }
 
-    inline unsigned int posToIndex(unsigned int x, unsigned int y) {
+    static inline unsigned int posToIndex(unsigned int x, unsigned int y) {
         return x + y * CHANNEL_SIZE_X;
     }
 
 	// classic GLSL-style hermite smoothstep function
-	inline float_4 smoothstep(float_4 x) {
+	static inline float_4 smoothstep(float_4 x) {
 		x = simd::clamp(x, 0., 1.);
 		return x*x*(3. - 2.*x);
 	}
 
 	// smoothstep fit to the error function
 	// https://www.desmos.com/calculator/molpuljtzy
-	inline float_4 smoothstep_erf(float_4 x) {
+	static inline float_4 smoothstep_erf(float_4 x) {
 		const float P = 0.3761264; //fits a smoothstep to error function with equal first derivative at x=0
 		x = P*x + 0.5;
 		return 2.0 * (smoothstep(x) - 0.5);
@@ -123,7 +122,7 @@ struct WaveChannel2 {
 
 	// smoothstep fit to the derivative of the error function (a gaussian)
 	// https://www.desmos.com/calculator/molpuljtzy
-	inline float_4 smoothstep_erf_deriv(float_4 x) {
+	static inline float_4 smoothstep_erf_deriv(float_4 x) {
 		const float P2 = 1.128379172; //fits a smoothstep to error function first derivative with equal second derivative at x=0
 		const float P3 = 0.577350268;
 
@@ -138,7 +137,7 @@ struct WaveChannel2 {
 		the signed distance function will have an erroneous 
 		value at exact integral values of x otherwise. 
 	*/
-	inline float_4 sgnZ(float_4 x) {
+	static inline float_4 sgnZ(float_4 x) {
 		float_4 signbit = x & -0.f;
 		return signbit | 1.f;
 	}
@@ -146,7 +145,7 @@ struct WaveChannel2 {
 	// Finds the closest distance from index to comp in a modular space.
 	// INDEX MUST BE IN THE RANGE 0 <= INDEX <= MAX_POSITION
     // TODO: I don't think this is still valid if used for 2D coords?
-	inline float_4 wrappedSignedDistance(float_4 index, float_4 comp) {
+	static inline float_4 wrappedSignedDistance(float_4 index, float_4 comp) {
 		float_4 c0 = simd::fabs(index - comp);
 		float_4 c1 = simd::fabs(index - comp + MAX_POSITION);
 		float_4 c2 = simd::fabs(index - comp - MAX_POSITION);
@@ -164,7 +163,7 @@ struct WaveChannel2 {
 	 */
 
     // TODO: this will need to be substantially changed to deal with 2D
-	inline float_4 approxGaussian(float_4 x, float_4 sig) {
+	static inline float_4 approxGaussian(float_4 x, float_4 sig) {
 		// float_4 x_s = wrappedSignedDistance(x, mean);
         float_4 x_s = x;
 		float_4 x_d_l = x_s-0.5;
@@ -181,7 +180,7 @@ struct WaveChannel2 {
 	 *  approximation of the first derivative of the error function.
 	 *  TODO: this will need to be substantially changed to deal with 2D
 	 */
-	inline float_4 approxGaussianDeriv(float_4 x, float_4 sig) {
+	static inline float_4 approxGaussianDeriv(float_4 x, float_4 sig) {
 		float_4 x_s = x;
 		float_4 x_d_l = x_s-0.5;
 		float_4 x_d_r = x_s+0.5;
@@ -201,7 +200,7 @@ struct WaveChannel2 {
 	 *   may also be faster than calling simd::sin below.
 	 *  TODO: this will need to be substantially changed to deal with 2D
 	 */
-	inline float_4 sinc(float_4 x, float_4 sig) {
+	static inline float_4 sinc(float_4 x, float_4 sig) {
 		float_4 x_s = x;
 		float_4 x_s2 = x_s / sig;
 		float_4 snc = simd::sin(x_s2)/x_s2;
@@ -209,12 +208,12 @@ struct WaveChannel2 {
 		return simd::ifelse(almost_zero, 1.0, snc);
 	}
 
-	void setParams(float damping, float timestep, float decay, float low_cut, float feedback) {
-		this->damping = damping;
-		this->timestep = timestep;
-		this->decay = decay;
-		this->low_cut = low_cut;
-		this->feedback = feedback;
+	void setParams(float t_damping, float t_timestep, float t_decay, float t_low_cut, float t_feedback) {
+		this->damping = t_damping;
+		this->timestep = t_timestep;
+		this->decay = t_decay;
+		this->low_cut = t_low_cut;
+		this->feedback = t_feedback;
 	}
 
 	bool input_probe_L_dirty = true;
@@ -226,16 +225,16 @@ struct WaveChannel2 {
     bool kernel_weights_dirty = true;
     bool kernel_weights_dirty_init = true;
 
-	void setDirtyProbe(bool& dirty_flag, const float& pos_prev, const float& sig_prev, const float& pos_next, const float& sig_next) {
+	static void setDirtyProbe(bool& dirty_flag, const float& pos_prev, const float& sig_prev, const float& pos_next, const float& sig_next) {
 		dirty_flag = (pos_prev != pos_next || sig_prev != sig_next);
 	}
 
-    void setDirtyKernelWeights(bool& dirty_flag, const float& anisotropy_prev, const float& anisotropy_next) {
+    static void setDirtyKernelWeights(bool& dirty_flag, const float& anisotropy_prev, const float& anisotropy_next) {
         dirty_flag = (anisotropy_prev != anisotropy_next);
     }
 
 	// Generate and normalize probe window buffers
-	void generateProbeWindow(std::vector<float_4> &w, bool isDirty, float pos, float sigma, ProbeType probeType) {
+	void generateProbeWindow(std::array<float_4, CHANNEL_SIZE> &w, bool isDirty, float pos, float sigma, ProbeType probeType) {
 		if (isDirty || dirty_init) {
 			float_4 w_sum = float_4(0.0);
             // TODO: until I make probe position 2D throughout, don't bother with smooth probe position transitions
@@ -248,8 +247,10 @@ struct WaveChannel2 {
 
 			for (unsigned int i = 0; i < CHANNEL_SIZE_X; i++) {
                 for (unsigned int j = 0; j < CHANNEL_SIZE_Y; j++) {
-                    float_4 f_x = float_4(4.0 * i, 4.0 * i + 1.0, 4.0 * i + 2.0, 4.0 * i + 3.0) - p_x;
-                    float_4 f_y = float_4(1.0 * j) - p_y;
+                    float f_idx = static_cast<float>(i);
+                    float f_jdx = static_cast<float>(j);
+                    float_4 f_x = float_4(4.0f * f_idx, 4.0f * f_idx + 1.0f, 4.0f * f_idx + 2.0f, 4.0f * f_idx + 3.0f) - p_x;
+                    float_4 f_y = float_4(1.0f * f_jdx) - p_y;
                     float_4 f_i = sqrt(f_x*f_x + f_y*f_y);
                     unsigned int idx = posToIndex(i, j);
                     switch (probeType) {
@@ -296,29 +297,29 @@ struct WaveChannel2 {
 	}
 
 	// Probe window buffers are only updated when the inputs change to save on computation cost.
-	void setProbeSettings(float pos_in_L, float pos_in_R, float pos_out_L, float pos_out_R, float sig_in_L, float sig_in_R, float sig_out_L, float sig_out_R) {
-		setDirtyProbe(input_probe_L_dirty, this->pos_in_L, this->sig_in_L, pos_in_L, sig_in_L);
-		setDirtyProbe(input_probe_R_dirty, this->pos_in_R, this->sig_in_R, pos_in_R, sig_in_R);
-		setDirtyProbe(output_probe_L_dirty, this->pos_out_L, this->sig_out_L, pos_out_L, sig_out_L);
-		setDirtyProbe(output_probe_R_dirty, this->pos_out_R, this->sig_out_R, pos_out_R, sig_out_R);
-		this->pos_in_L = pos_in_L;
-		this->pos_in_R = pos_in_R;
-		this->sig_in_L = sig_in_L;
-		this->sig_in_R = sig_in_R;
-		this->pos_out_L = pos_out_L;
-		this->pos_out_R = pos_out_R;
-		this->sig_out_L = sig_out_L;
-		this->sig_out_R = sig_out_R;
-		generateProbeWindow(input_probe_L_window, input_probe_L_dirty, this->pos_in_L, this->sig_in_L, input_probe_type_L);
-		generateProbeWindow(input_probe_R_window, input_probe_R_dirty, this->pos_in_R, this->sig_in_R, input_probe_type_R);
-		generateProbeWindow(output_probe_L_window, output_probe_L_dirty, this->pos_out_L, this->sig_out_L, output_probe_type_L);
-		generateProbeWindow(output_probe_R_window, output_probe_R_dirty, this->pos_out_R, this->sig_out_R, output_probe_type_R);
+	void setProbeSettings(float t_pos_in_L, float t_pos_in_R, float t_pos_out_L, float t_pos_out_R, float t_sig_in_L, float t_sig_in_R, float t_sig_out_L, float t_sig_out_R) {
+		setDirtyProbe(input_probe_L_dirty, this->pos_in_L, this->sig_in_L, t_pos_in_L, t_sig_in_L);
+		setDirtyProbe(input_probe_R_dirty, this->pos_in_R, this->sig_in_R, t_pos_in_R, t_sig_in_R);
+		setDirtyProbe(output_probe_L_dirty, this->pos_out_L, this->sig_out_L, t_pos_out_L, t_sig_out_L);
+		setDirtyProbe(output_probe_R_dirty, this->pos_out_R, this->sig_out_R, t_pos_out_R, t_sig_out_R);
+		this->pos_in_L = t_pos_in_L;
+		this->pos_in_R = t_pos_in_R;
+		this->sig_in_L = t_sig_in_L;
+		this->sig_in_R = t_sig_in_R;
+		this->pos_out_L = t_pos_out_L;
+		this->pos_out_R = t_pos_out_R;
+		this->sig_out_L = t_sig_out_L;
+		this->sig_out_R = t_sig_out_R;
+		generateProbeWindow(modelParams.input_probe_L_window, input_probe_L_dirty, this->pos_in_L, this->sig_in_L, input_probe_type_L);
+		generateProbeWindow(modelParams.input_probe_R_window, input_probe_R_dirty, this->pos_in_R, this->sig_in_R, input_probe_type_R);
+		generateProbeWindow(modelParams.output_probe_L_window, output_probe_L_dirty, this->pos_out_L, this->sig_out_L, output_probe_type_L);
+		generateProbeWindow(modelParams.output_probe_R_window, output_probe_R_dirty, this->pos_out_R, this->sig_out_R, output_probe_type_R);
 	}
 
-    void setKernelSettings(float anisotropy) {
-        setDirtyKernelWeights(kernel_weights_dirty, this->anisotropy, anisotropy);
-        this->anisotropy = anisotropy;
-        generateKernelWeights(anisotropy, kernel_weights_dirty);
+    void setKernelSettings(float t_anisotropy) {
+        setDirtyKernelWeights(kernel_weights_dirty, this->anisotropy, t_anisotropy);
+        this->anisotropy = t_anisotropy;
+        generateKernelWeights(t_anisotropy, kernel_weights_dirty);
     }
 
     /*
@@ -335,28 +336,28 @@ struct WaveChannel2 {
      * For an initial test run of this idea, we'll simply provide a control for the anisotropy of the kernel.
      */
 
-    // let's say for now that anisotropy = 1 means maximum horizontal / vertical ratio,
-    // and anistropy = -1 means maximum vertical / horizontal ratio
+    // let's say for now that t_anisotropy = 1 means maximum horizontal / vertical ratio,
+    // and anisotropy = -1 means maximum vertical / horizontal ratio
     // For stability reasons, we'll probably want to fix the larger of the two values to 1,
     // although through testing we can find if larger values are feasible
-    void generateKernelWeights(float anisotropy, bool isDirty) {
+    void generateKernelWeights(float t_anisotropy, bool isDirty) {
         if (isDirty || kernel_weights_dirty_init) {
-            float h_weight = 1.;
-            float v_weight = 1.;
-            if (anisotropy < 0.) {
-                h_weight = 1./(1. - anisotropy * 4.);
+            float h_weight = 1.f;
+            float v_weight = 1.f;
+            if (t_anisotropy < 0.f) {
+                h_weight = 1.f/(1.f - t_anisotropy * 4.f);
             } else {
-                v_weight = 1./(1. + anisotropy * 4.);
+                v_weight = 1.f/(1.f + t_anisotropy * 4.f);
             }
-            float c_weight = -(2.*h_weight + 2.*v_weight);
+            float c_weight = -(2.f*h_weight + 2.f*v_weight);
             for (int i = 0; i < CHANNEL_SIZE_X; i++) {
                 for (int j = 0; j < CHANNEL_SIZE_Y; j++) {
                     unsigned int idx = posToIndex(i, j);
-                    kernel_weight_N[idx] = float_4(v_weight);
-                    kernel_weight_S[idx] = float_4(v_weight);
-                    kernel_weight_E[idx] = float_4(h_weight);
-                    kernel_weight_W[idx] = float_4(h_weight);
-                    kernel_weight_C[idx] = float_4(c_weight);
+                    modelParams.kernel_weight_N[idx] = float_4(v_weight);
+                    modelParams.kernel_weight_S[idx] = float_4(v_weight);
+                    modelParams.kernel_weight_E[idx] = float_4(h_weight);
+                    modelParams.kernel_weight_W[idx] = float_4(h_weight);
+                    modelParams.kernel_weight_C[idx] = float_4(c_weight);
                 }
             }
         }
@@ -371,7 +372,7 @@ struct WaveChannel2 {
 		additive_mode_R = !additive_mode_R;
 	}
 
-	void updateProbeType(ProbeType &typeToChange) {
+	static void updateProbeType(ProbeType &typeToChange) {
 		switch(typeToChange) {
 			case INTEGRAL:
 				typeToChange = ProbeType::DIFFERENTIAL; break;
@@ -385,29 +386,29 @@ struct WaveChannel2 {
 	//void toggleDifferentialModeL() {
 	void toggleInputProbeTypeL() {
 		updateProbeType(input_probe_type_L);
-		generateProbeWindow(input_probe_L_window, true, this->pos_in_L, this->sig_in_L, input_probe_type_L);
+		generateProbeWindow(modelParams.input_probe_L_window, true, this->pos_in_L, this->sig_in_L, input_probe_type_L);
 	}
 
 	void toggleInputProbeTypeR() {
 		updateProbeType(input_probe_type_R);
-		generateProbeWindow(input_probe_R_window, true, this->pos_in_R, this->sig_in_R, input_probe_type_R);
+		generateProbeWindow(modelParams.input_probe_R_window, true, this->pos_in_R, this->sig_in_R, input_probe_type_R);
 	}
 
 	void toggleOutputProbeTypeL() {
 		updateProbeType(output_probe_type_L);
-		generateProbeWindow(output_probe_L_window, true, this->pos_out_L, this->sig_out_L, output_probe_type_L);
+		generateProbeWindow(modelParams.output_probe_L_window, true, this->pos_out_L, this->sig_out_L, output_probe_type_L);
 	}
 
 	void toggleOutputProbeTypeR() {
 		updateProbeType(output_probe_type_R);
-		generateProbeWindow(output_probe_R_window, true, this->pos_out_R, this->sig_out_R, output_probe_type_R);
+		generateProbeWindow(modelParams.output_probe_R_window, true, this->pos_out_R, this->sig_out_R, output_probe_type_R);
 	}
 
-	void setProbeInputs(float amp_in_L, float amp_in_R) {
+	void setProbeInputs(float t_amp_in_L, float t_amp_in_R) {
 		this->amp_in_prev_L = this->amp_in_L;
 		this->amp_in_prev_R = this->amp_in_R;
-		this->amp_in_L = amp_in_L;
-		this->amp_in_R = amp_in_R;
+		this->amp_in_L = t_amp_in_L;
+		this->amp_in_R = t_amp_in_R;
 	}
 
 	void setNextModel() {
@@ -422,12 +423,24 @@ struct WaveChannel2 {
 				this->model = Model::RK4_ADVECTION;
 				break;
 			case RK4_ADVECTION:
-				this->model = Model::WAVE_EQUATION;
+				this->model = Model::SHALLOW_WATER;
 				break;
+            case SHALLOW_WATER:
+                this->model = Model::YANG_JUMPING;
+                break;
+            case YANG_JUMPING:
+                this->model = Model::EULER_COMPRESSIBLE;
+                break;
+            case EULER_COMPRESSIBLE:
+                this->model = Model::WAVE_EQUATION;
+                break;
+            default:
+                this->model = Model::WAVE_EQUATION;
+                break;
 		}
 	}
 
-	const char* getModelString() {
+	const char* getModelString() const {
 		const char* text;
 		switch(model) {
 			case WaveChannel2::Model::WAVE_EQUATION:
@@ -442,6 +455,15 @@ struct WaveChannel2 {
 			case WaveChannel2::Model::SQUID_AXON:
 				text = "SQUID_AXON";
 				break;
+            case WaveChannel2::Model::SHALLOW_WATER:
+                text = "SHALLOW_WATER";
+                break;
+            case WaveChannel2::Model::YANG_JUMPING:
+                text = "YANG_JUMPING";
+                break;
+            case WaveChannel2::Model::EULER_COMPRESSIBLE:
+                text = "EULER_COMPRESSIBLE";
+                break;
 			default:
 				text = "";
 				break;
@@ -449,7 +471,7 @@ struct WaveChannel2 {
 		return text;
 	}
 
-	bool isModMode() {
+	bool isModMode() const {
 		switch(model) {
 			case WaveChannel2::Model::RK4_ADVECTION:
 				return true;
@@ -458,11 +480,11 @@ struct WaveChannel2 {
 		}
 	}
 
-	float getAmpOutL() {
+	float getAmpOutL() const {
 		return amp_out_L;
 	}
 
-	float getAmpOutR() {
+	float getAmpOutR() const {
 		return amp_out_R;
 	}
 
@@ -481,37 +503,152 @@ struct WaveChannel2 {
 		}
 	}
 
-    ModelIter_Data<2, CHANNEL_SIZE> dataPing;
-    ModelIter_Data<2, CHANNEL_SIZE> dataPong = dataPing.create_swapped_copy();
+    void debugPrint(std::array<float_4, CHANNEL_SIZE> &arr, const std::string &title, int w = 5, int p = 2) {
+
+        std::cout << title << "\n";
+        std::cout << std::fixed << std::setprecision(p);
+        for (int j = 0; j < CHANNEL_SIZE_Y; j++) {
+            for (int i = 0; i < CHANNEL_SIZE_X; i++) {
+                float_4 xd = arr[posToIndex(i, j)];
+                std::cout << std::setw(w) << xd[0] << ", " << std::setw(w) << xd[1] << ", " << std::setw(w) << xd[2] << ", " << std::setw(w) << xd[3] << ", ";
+            }
+            std::cout << "\n";
+        }
+    }
+
+    std::array<float_4, CHANNEL_SIZE> displayData;
+
+    ModelIter_Data<2, CHANNEL_SIZE> modelData;
+    ModelIter_Data<3, CHANNEL_SIZE> modelData3;
     ModelParams<CHANNEL_SIZE> modelParams;
+
+    std::array<float, 2> clamp2 = {100.f, 100.f};
+    std::array<float, 3> clamp3 = {100.f, 100.f, 100.f};
+    std::array<float, 3> clampEulerCompressible = {1.f, 1.f, 10.f};
+
+    SchrodingerFunctor<2, CHANNEL_SIZE> schrodingerFunctor;
+    WaveEquationFunctor<2, CHANNEL_SIZE> waveEquationFunctor;
+    SquidAxonFunctor<2, CHANNEL_SIZE> squidAxonFunctor;
+    AdvectionFunctor<2, CHANNEL_SIZE> advectionFunctor;
+    ShallowWaterFunctor<3, CHANNEL_SIZE> shallowWaterFunctor;
+    YangJumpingFunctor<3, CHANNEL_SIZE> yangJumpingFunctor;
+    EulerCompressibleFunctor<3, CHANNEL_SIZE> eulerCompressibleFunctor;
+
+    long frame = 0;
 
 	// Update the ping-pong buffers
 	void update() {
 		setClipRange();
-		//setModelPointer();
-        ModelIter_Data<2, CHANNEL_SIZE>* data;
-        if (pong) {
-            data = &dataPing;
-        } else {
-            data = &dataPong;
-        }
 
+        /* TODO: Temporary set up, these should be written directly
+         *  These structs should be broken up differently. I'm thinking:
+         *  1. Data that needs to get the parameter count template parameter
+         *  2. Data that needs the channel size template parameter
+         *  3. Data that doesn't need template parameters
+         *  4. Data that is read-only in the solver
+         *  5. Data that is written in the solver
+         *  These are partially overlapping, so not necessarily 5 structs.
+         */
+        modelData.setPing();
+        modelData3.setPing();
+        modelParams.amp_in_L = this->amp_in_L;
+        modelParams.amp_in_R = this->amp_in_R;
+        modelParams.amp_in_prev_L = this->amp_in_prev_L;
+        modelParams.amp_in_prev_R = this->amp_in_prev_R;
+        modelParams.low_cut = this->low_cut;
+        modelParams.damping = this->damping;
+        modelParams.decay = this->decay;
+        modelParams.feedback = ((this->model == Model::SQUID_AXON) ? 4.f * this->feedback : this->feedback); // more feedback for squid axon
+        modelParams.safe_damping = std::min(1.0f, 1.0f/(2.0f*this->timestep)); // limits diffusion term to max of 0.5
+        modelParams.pos_in_R = this->pos_in_R;
+        modelParams.sig_in_R = this->sig_in_R;
+        modelParams.timestep = this->timestep;
+
+        // if I go this route for displaydata, should copy it much less frequently
         switch(this->model) {
             case SQUID_AXON:
-                RK4_iter_3_8s<2, CHANNEL_SIZE, stepSquidAxon<2, CHANNEL_SIZE>>(*data, modelParams);
+                RK4_iter_3_8s<2, CHANNEL_SIZE, SquidAxonFunctor<2, CHANNEL_SIZE>>(modelData, modelParams, squidAxonFunctor, clamp2);
+                std::copy(modelData.getOutput()[0].begin(), modelData.getOutput()[0].end(), displayData.begin());
                 break;
             case SCHRODINGER:
-                RK4_iter_3_8s<2, CHANNEL_SIZE, stepSchrodinger<2, CHANNEL_SIZE>>(*data, modelParams);
+                RK4_iter_3_8s<2, CHANNEL_SIZE, SchrodingerFunctor<2, CHANNEL_SIZE>>(modelData, modelParams, schrodingerFunctor, clamp2);
+                std::copy(modelData.getOutput()[0].begin(), modelData.getOutput()[0].end(), displayData.begin());
                 break;
             case RK4_ADVECTION:
-                RK4_iter_3_8s<2, CHANNEL_SIZE, stepRK4Advection<2, CHANNEL_SIZE>>(*data, modelParams);
+                RK4_iter_3_8s<2, CHANNEL_SIZE, AdvectionFunctor<2, CHANNEL_SIZE>>(modelData, modelParams, advectionFunctor, clamp2);
+                std::copy(modelData.getOutput()[0].begin(), modelData.getOutput()[0].end(), displayData.begin());
                 break;
             case WAVE_EQUATION:
-                RK4_iter_3_8s<2, CHANNEL_SIZE, stepWaveEquation<2, CHANNEL_SIZE>>(*data, modelParams);
+                RK4_iter_3_8s<2, CHANNEL_SIZE, WaveEquationFunctor<2, CHANNEL_SIZE>>(modelData, modelParams, waveEquationFunctor, clamp2);
+                std::copy(modelData.getOutput()[0].begin(), modelData.getOutput()[0].end(), displayData.begin());
+                break;
+            case SHALLOW_WATER:
+                RK4_iter_3_8s<3, CHANNEL_SIZE, ShallowWaterFunctor<3, CHANNEL_SIZE>>(modelData3, modelParams, shallowWaterFunctor, clamp3);
+                std::copy(modelData3.getOutput()[0].begin(), modelData3.getOutput()[0].end(), displayData.begin());
+                break;
+            case YANG_JUMPING:
+                RK4_iter_3_8s<3, CHANNEL_SIZE, YangJumpingFunctor<3, CHANNEL_SIZE>>(modelData3, modelParams, yangJumpingFunctor, clamp3);
+                std::copy(modelData3.getOutput()[0].begin(), modelData3.getOutput()[0].end(), displayData.begin());
+                break;
+            case EULER_COMPRESSIBLE:
+                RK4_iter_3_8s<3, CHANNEL_SIZE, EulerCompressibleFunctor<3, CHANNEL_SIZE>>(modelData3, modelParams, eulerCompressibleFunctor, clampEulerCompressible);
+                std::copy(modelData3.getOutput()[2].begin(), modelData3.getOutput()[2].end(), displayData.begin());
+                break;
+            default:
                 break;
         }
 
-		pong = !pong;
+        this->amp_out_L = modelParams.amp_out_L;
+        this->amp_out_R = modelParams.amp_out_R;
+
+#define DEBUG_MODEL_DATA_PRINT
+#ifdef DEBUG_MODEL_DATA_PRINT
+        if (frame % 1000000 == 0) {
+            debugPrint(modelData3.getInput()[0], "param A:");
+            debugPrint(modelData3.getInput()[1], "param B:");
+            debugPrint(modelData3.t_laplacian[0], "lapl A:");
+            debugPrint(modelData3.t_laplacian[1], "lapl B:");
+            debugPrint(modelData3.getOutput()[0], "param A out:");
+            debugPrint(modelData3.getOutput()[1], "param B out:");
+            debugPrint(modelData3.grad_1[0], "grad 1 A:");
+            debugPrint(modelData3.grad_1[1], "grad 1 B:");
+            debugPrint(modelData3.grad_2[0], "grad 2 A:");
+            debugPrint(modelData3.grad_2[1], "grad 2 B:");
+            debugPrint(modelData3.grad_3[0], "grad 3 A:");
+            debugPrint(modelData3.grad_3[1], "grad 3 B:");
+            debugPrint(modelData3.grad_4[0], "grad 4 A:");
+            debugPrint(modelData3.grad_4[1], "grad 4 B:");
+            debugPrint(modelData3.half_1[0], "half 1 A:");
+            debugPrint(modelData3.half_1[1], "half 1 B:");
+            debugPrint(modelData3.half_2[0], "half 2 A:");
+            debugPrint(modelData3.half_2[1], "half 2 B:");
+            debugPrint(modelData3.half_3[0], "half 3 A:");
+            debugPrint(modelData3.half_3[1], "half 3 B:");
+            debugPrint(modelData3.half_4[0], "half 4 A:");
+            debugPrint(modelData3.half_4[1], "half 4 B:");
+            debugPrint(modelParams.kernel_weight_N, "kernel N:");
+            debugPrint(modelParams.kernel_weight_E, "kernel E:");
+            debugPrint(modelParams.kernel_weight_S, "kernel S:");
+            debugPrint(modelParams.kernel_weight_W, "kernel W:");
+            debugPrint(modelParams.kernel_weight_C, "kernel C:");
+
+            std::cout << std::setprecision(5);
+            std::cout << "local timestep " << this->timestep << " model timestep " << modelParams.timestep << "\n";
+            std::cout << "local damping " << this->damping << " model damping " << modelParams.damping << "\n";
+            std::cout << "model safe_damping " << modelParams.safe_damping << "\n";
+            std::cout << "local decay " << this->decay << " model decay " << modelParams.decay << "\n";
+            std::cout << "local low_cut " << this->low_cut << " model low_cut " << modelParams.low_cut << "\n";
+            std::cout << "local feedback " << this->feedback << " model feedback " << modelParams.feedback << "\n";
+            std::cout << "local amp_in_prev_L " << this->amp_in_prev_L << " model amp_in_prev_L " << modelParams.amp_in_prev_L << "\n";
+            std::cout << "local amp_in_prev_R " << this->amp_in_prev_R << " model amp_in_prev_R " << modelParams.amp_in_prev_R << "\n";
+            std::cout << "local ampinL " << this->amp_in_L << " model ampinL " << modelParams.amp_in_L << "\n";
+            std::cout << "local ampinR " << this->amp_in_R << " model ampinR " << modelParams.amp_in_R << "\n";
+            std::cout << "local ampoutL " << this->amp_out_L << " model ampoutL " << modelParams.amp_out_L << "\n";
+            std::cout << "local ampoutR " << this->amp_out_R << " model ampoutR " << modelParams.amp_out_R << "\n";
+        }
+        frame++;
+#else
+#endif
 	}
 };
 
@@ -659,13 +796,13 @@ struct WaterTable2 : Module {
 	//#define TIMESTEP_SHIFT 3.191
 	#define TIMESTEP_SHIFT 5.191
 	#define TIMESTEP_MAX 0.4
-	#define TIMESTEP_KNOB_MIN -5.0
+	#define TIMESTEP_KNOB_MIN (-5.0)
 	#define TIMESTEP_KNOB_MAX 5.0
 	#define TIMESTEP_DEF 0.0
 	#define TIMESTEP_SLEW_RATE 0.02f
 	#define TIMESTEP_POST_SCALE 1.5
 
-	#define FEEDBACK_MIN -8.0
+	#define FEEDBACK_MIN (-8.0)
 	#define FEEDBACK_MAX 8.0
 	#define FEEDBACK_DEF 0.0
 
@@ -711,7 +848,7 @@ struct WaterTable2 : Module {
 		waveChannel.setNextModel();
 	}
 
-	void setLightPatternProbeType(WaveChannel2::ProbeType probeType, float &integralLight, float &differentialLight, float &sincLight, bool override) {
+	static void setLightPatternProbeType(WaveChannel2::ProbeType probeType, float &integralLight, float &differentialLight, float &sincLight, bool override) {
 		switch(probeType) {
 			case WaveChannel2::ProbeType::DIFFERENTIAL:
 				differentialLight = 1.0;
@@ -741,7 +878,7 @@ struct WaterTable2 : Module {
 		}
 	}
 
-	void setLightPatternAdditive(bool additiveMode, float &additiveLight, float &multiplicativeLight, bool override) {
+	static void setLightPatternAdditive(bool additiveMode, float &additiveLight, float &multiplicativeLight, bool override) {
 		if (override) {
 			additiveLight = 0.0;
 			multiplicativeLight = 0.0;
@@ -820,7 +957,7 @@ struct WaterTable2 : Module {
 		// Light
 		if (lightDivider.process()) {
 				float lightValue = amp_out_L;
-				lights[EOC_LIGHT].setSmoothBrightness(lightValue, args.sampleTime * lightDivider.getDivision());
+				lights[EOC_LIGHT].setSmoothBrightness(lightValue, args.sampleTime * static_cast<float>(lightDivider.getDivision()));
 
 				float pos_light = 0.0;
 				float mod_light = 0.0;
@@ -874,7 +1011,7 @@ struct WaterTable2 : Module {
 		}
 	}
 
-	int getOversamplingMode() {
+	int getOversamplingMode() const {
 		return static_cast<int>(waveChannel.oversampling_mode);
 	}
 
@@ -882,7 +1019,7 @@ struct WaterTable2 : Module {
 		waveChannel.oversampling_mode = static_cast<WaveChannel2::OversamplingMode>(mode);
 	}
 
-	int getClipRangeMode() {
+	int getClipRangeMode() const {
 		return static_cast<int>(waveChannel.clip_range_mode);
 	}
 
@@ -890,53 +1027,53 @@ struct WaterTable2 : Module {
 		waveChannel.clip_range_mode = static_cast<WaveChannel2::ClipRange>(mode);
 	}
 
-	void booleanFromJson(json_t* rootJ, bool &val, const char* json_label) {
+	static void booleanFromJson(json_t* rootJ, bool &val, const char* json_label) {
 		json_t* j_val = json_object_get(rootJ, json_label);
 		if (j_val)
 			val = json_boolean_value(j_val);
 	}
 
-	void booleanToJson(json_t* rootJ, bool &val, const char* json_label) {
+	static void booleanToJson(json_t* rootJ, bool &val, const char* json_label) {
 		json_object_set_new(rootJ, json_label, json_boolean(val));
 	}
 
-	void modelFromJson(json_t* rootJ, WaveChannel2::Model &val, const char* json_label) {
+	static void modelFromJson(json_t* rootJ, WaveChannel2::Model &val, const char* json_label) {
 		json_t* j_val = json_object_get(rootJ, json_label);
 		if (j_val)
 			val = static_cast<WaveChannel2::Model>(json_integer_value(j_val));
 	}
 
-	void modelToJson(json_t* rootJ, WaveChannel2::Model &val, const char* json_label) {
+	static void modelToJson(json_t* rootJ, WaveChannel2::Model &val, const char* json_label) {
 		json_object_set_new(rootJ, json_label, json_integer(static_cast<int>(val)));
 	}
 
-	void probeFromJson(json_t* rootJ, WaveChannel2::ProbeType &val, const char* json_label) {
+	static void probeFromJson(json_t* rootJ, WaveChannel2::ProbeType &val, const char* json_label) {
 		json_t* j_val = json_object_get(rootJ, json_label);
 		if (j_val)
 			val = static_cast<WaveChannel2::ProbeType>(json_integer_value(j_val));
 	}
 
-	void probeToJson(json_t* rootJ, WaveChannel2::ProbeType &val, const char* json_label) {
+	static void probeToJson(json_t* rootJ, WaveChannel2::ProbeType &val, const char* json_label) {
 		json_object_set_new(rootJ, json_label, json_integer(static_cast<int>(val)));
 	}
 
-	void oversamplingModeFromJson(json_t* rootJ, WaveChannel2::OversamplingMode &val, const char* json_label) {
+	static void oversamplingModeFromJson(json_t* rootJ, WaveChannel2::OversamplingMode &val, const char* json_label) {
 		json_t* j_val = json_object_get(rootJ, json_label);
 		if (j_val)
 			val = static_cast<WaveChannel2::OversamplingMode>(json_integer_value(j_val));
 	}
 
-	void oversamplingModeToJson(json_t* rootJ, WaveChannel2::OversamplingMode &val, const char* json_label) {
+	static void oversamplingModeToJson(json_t* rootJ, WaveChannel2::OversamplingMode &val, const char* json_label) {
 		json_object_set_new(rootJ, json_label, json_integer(static_cast<int>(val)));
 	}
 
-	void clipRangeModeFromJson(json_t* rootJ, WaveChannel2::ClipRange &val, const char* json_label) {
+	static void clipRangeModeFromJson(json_t* rootJ, WaveChannel2::ClipRange &val, const char* json_label) {
 		json_t* j_val = json_object_get(rootJ, json_label);
 		if (j_val)
 			val = static_cast<WaveChannel2::ClipRange>(json_integer_value(j_val));
 	}
 
-	void clipRangeModeToJson(json_t* rootJ, WaveChannel2::ClipRange &val, const char* json_label) {
+	static void clipRangeModeToJson(json_t* rootJ, WaveChannel2::ClipRange &val, const char* json_label) {
 		json_object_set_new(rootJ, json_label, json_integer(static_cast<int>(val)));
 	}
 
@@ -993,20 +1130,20 @@ struct WaterTable2 : Module {
 
 
 struct WaterTable2Widget : ModuleWidget {
-	WaterTable2Widget(WaterTable2* module) {
+	explicit WaterTable2Widget(WaterTable2* module) {
 		setModule(module);
 		setPanel(APP->window->loadSvg(asset::plugin(pluginInstance, "res/WaterTable.svg")));
 
-		/*  lambdas below MUST BE pass by value or we segfault when the reference goes out of scope.
-			this way of setting up the buttons is somewhat bizarre, but it does reduce boilerplate substantially.
-		*/
+		/*
+		 * lambdas below MUST BE pass by value or we segfault when the reference goes out of scope.
+		 */
 		{
 			//addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(69.566, 83.327)), module, WaterTable2::MODEL_BUTTON_PARAM));
-			FreeSurfaceLogoToggleDark<WaterTable2, 4>* button 
-					= createParamCentered<FreeSurfaceLogoToggleDark<WaterTable2, 4>>(mm2px(Vec(69.566, 83.327)), module, WaterTable2::MODEL_BUTTON_PARAM);
+			auto* button
+					= createParamCentered<FreeSurfaceLogoToggleDark<WaterTable2, WaveChannel2::NUM_MODELS>>(mm2px(Vec(69.566, 83.327)), module, WaterTable2::MODEL_BUTTON_PARAM);
 			button->config(
 				"Model", 
-				std::vector<std::string>{"WAVE EQUATION", "SQUID AXON", "SCHRODINGER", "RUNGE KUTTA RK4"},
+				std::vector<std::string>{"WAVE EQUATION", "SQUID AXON", "SCHRODINGER", "RUNGE KUTTA RK4", "SHALLOW WATER", "YANG JUMPING", "EULER COMPRESSIBLE"},
 				true, 
 				[=] () -> int { return static_cast<int>(module->waveChannel.model); },
 				[=] () -> void { module->waveChannel.setNextModel(); },
@@ -1017,7 +1154,7 @@ struct WaterTable2Widget : ModuleWidget {
 
 		{
 			//addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(18.94, 66.2)), module, WaterTable2::MULTIPLICATIVE_BUTTON_L_PARAM));
-			RoundToggleDark<WaterTable2, 2>* button 
+			auto* button
 					= createParamCentered<RoundToggleDark<WaterTable2, 2>>(mm2px(Vec(18.94, 66.2)), module, WaterTable2::MULTIPLICATIVE_BUTTON_L_PARAM);
 			button->config(
 				"Left Input Mode",
@@ -1032,7 +1169,7 @@ struct WaterTable2Widget : ModuleWidget {
 
 		{
 			//addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(48.062, 66.2)), module, WaterTable2::MULTIPLICATIVE_BUTTON_R_PARAM));
-			RoundToggleDark<WaterTable2, 3>* button 
+			auto* button
 					= createParamCentered<RoundToggleDark<WaterTable2, 3>>(mm2px(Vec(48.062, 66.2)), module, WaterTable2::MULTIPLICATIVE_BUTTON_R_PARAM);
 			button->config(
 				"Right Input Mode",
@@ -1047,7 +1184,7 @@ struct WaterTable2Widget : ModuleWidget {
 
 		{
 			//addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(5.018, 66.198)), module, WaterTable2::INPUT_PROBE_TYPE_BUTTON_L_PARAM));
-			RoundToggleDark<WaterTable2, 3>* button 
+			auto* button
 					= createParamCentered<RoundToggleDark<WaterTable2, 3>>(mm2px(Vec(5.018, 66.198)), module, WaterTable2::INPUT_PROBE_TYPE_BUTTON_L_PARAM);
 			button->config(
 				"Left Input Shape",
@@ -1062,7 +1199,7 @@ struct WaterTable2Widget : ModuleWidget {
 
 		{
 			//addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(34.14, 66.198)), module, WaterTable2::INPUT_PROBE_TYPE_BUTTON_R_PARAM));
-			RoundToggleDark<WaterTable2, 4>* button 
+			auto* button
 					= createParamCentered<RoundToggleDark<WaterTable2, 4>>(mm2px(Vec(34.14, 66.198)), module, WaterTable2::INPUT_PROBE_TYPE_BUTTON_R_PARAM);
 			button->config(
 				"Right Input Shape",
@@ -1077,7 +1214,7 @@ struct WaterTable2Widget : ModuleWidget {
 
 		{
 			//addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(4.991, 121.739)), module, WaterTable2::OUTPUT_PROBE_TYPE_BUTTON_L_PARAM));
-			RoundToggleDark<WaterTable2, 3>* button 
+			auto* button
 					= createParamCentered<RoundToggleDark<WaterTable2, 3>>(mm2px(Vec(4.991, 121.739)), module, WaterTable2::OUTPUT_PROBE_TYPE_BUTTON_L_PARAM);
 			button->config(
 				"Left Output Shape",
@@ -1092,7 +1229,7 @@ struct WaterTable2Widget : ModuleWidget {
 
 		{
 			//addParam(createParamCentered<RoundBlackKnob>(mm2px(Vec(34.287, 121.739)), module, WaterTable2::OUTPUT_PROBE_TYPE_BUTTON_R_PARAM));
-			RoundToggleDark<WaterTable2, 3>* button 
+			auto* button
 					= createParamCentered<RoundToggleDark<WaterTable2, 3>>(mm2px(Vec(34.287, 121.739)), module, WaterTable2::OUTPUT_PROBE_TYPE_BUTTON_R_PARAM);
 			button->config(
 				"Right Output Shape",
@@ -1108,7 +1245,7 @@ struct WaterTable2Widget : ModuleWidget {
 		{
 			// mm2px(Vec(60.444, 62.491))
 			//addChild(createWidget<Widget>(mm2px(Vec(59.822, 9.072))));
-			WaterTable2Display<WaterTable2, CHANNEL_SIZE, CHANNEL_SIZE_FLOATS>* display = new WaterTable2Display<WaterTable2, CHANNEL_SIZE, CHANNEL_SIZE_FLOATS>();
+			auto* display = new WaterTable2Display<WaterTable2, CHANNEL_SIZE, CHANNEL_SIZE_FLOATS>();
 			display->module = module;
 			display->box.pos = mm2px(Vec(59.822, 9.072));
 			display->box.size = mm2px(Vec(60.444, 62.491));
@@ -1205,7 +1342,7 @@ struct WaterTable2Widget : ModuleWidget {
 	}
 
 	void appendContextMenu(Menu* menu) override {
-		WaterTable2* module = dynamic_cast<WaterTable2*>(this->module);
+		auto* module = dynamic_cast<WaterTable2*>(this->module);
 		assert(module);
 
 		menu->addChild(new MenuSeparator);
