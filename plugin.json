@@ -35,6 +35,12 @@
       "name": "FirstCompressor",
       "description": "Physical modeling system with a fully analog design",
       "tags": ["Distortion", "Filter", "Panning", "Ring modulator", "Physical modeling"]
+    },
+    {
+      "slug": "FreeSurface-PhiReverb",
+      "name": "PhiReverb",
+      "description": "Physical modeling system with a fully analog design",
+      "tags": ["Distortion", "Filter", "Panning", "Ring modulator", "Physical modeling"]
     }
   ]
 }

@@ -17,4 +17,5 @@ extern Model* modelWaterTable2;
 //extern Model* modelAliasFreeDistortion;
 extern Model* modelStereoToMonoFFT;
 extern Model* modelFirstCompressor;
+extern Model* modelPhiReverb;
 

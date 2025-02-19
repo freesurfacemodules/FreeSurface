@@ -11,4 +11,5 @@ void init(rack::Plugin* p) {
     //p->addModel(modelAliasFreeDistortion);
     p->addModel(modelStereoToMonoFFT);
     p->addModel(modelFirstCompressor);
+    p->addModel(modelPhiReverb);
 }
