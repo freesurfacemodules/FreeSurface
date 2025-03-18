@@ -39,9 +39,9 @@ struct KalmanPitchTracker : Module {
 		NUM_LIGHTS
 	};
 	
-	float f0 = 1.;
-	float amp = 0.001;
-	float phi = 0.001*M_PIf;
+	float f0 = 1.f;
+	float amp = 0.001f;
+	float phi = 0.001f*M_PI;
 	
 	const Complex I = Complex(0.f, 1.f);
 
@@ -215,7 +215,7 @@ struct KalmanPitchTracker : Module {
 		Complex D = in - 0.5f*(x[1] + x[2]);
 		
 		//Q = pow(10,-(coeff-std::abs(D(0))));
-		float Q = pow(10.f,-std::clamp(coeff-std::abs(D), 1.f, 20.f));
+		float Q = pow(10.f,-math::clamp(coeff-std::abs(D), 1.f, 20.f));
 		//float Q = pow(10.f,-(coeff-std::abs(D)));
 		
 		//P_next = F*P*F.adjoint() + Q*Iden;
