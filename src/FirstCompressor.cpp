@@ -4,8 +4,7 @@
 #include "Lut.hpp"
 #include "DspFilters/Filter.h"
 #include "DspFilters/Butterworth.h"
-#include "DspFilters/RBJ.h"
-#include "DspFilters/SmoothedFilter.h"
+#include "Biquad2Fast.hpp"
 
 using namespace rack;
 
@@ -21,6 +20,7 @@ struct FirstCompressorModule : Module {
         PARAM_S,
         PARAM_T,
         PARAM_C,
+        PARAM_R,
         PARAM_B,
         NUM_PARAMS
     };
@@ -32,17 +32,12 @@ struct FirstCompressorModule : Module {
     enum OutputIds {
         OUTPUT_L,
         OUTPUT_R,
+        OUTPUT_G,
         NUM_OUTPUTS
     };
     enum LightIds {
         NUM_LIGHTS
     };
-
-    dsp::TBiquadFilter<double> biquad_input_L;
-    dsp::TBiquadFilter<double> biquad_input_R;
-
-    Dsp::Filter* biquad_L;
-    Dsp::Filter* biquad_R;
 
     Dsp::SimpleFilter<Dsp::Butterworth::LowPass<8>, 1> aa_filter_L;
     Dsp::SimpleFilter<Dsp::Butterworth::LowPass<8>, 1> aa_filter_R;
@@ -62,19 +57,14 @@ struct FirstCompressorModule : Module {
 
     float out_L;
     float out_R;
-    
-    float slew_prev_L = 0.f;
-    float slew_prev_R = 0.f;
-
-    const float biquad_cutoff = 0.25f;
-    const float biquad_Q = 0.25f;
-    const float biquad_gain = 1.0f;
 
     // store previous cutoff to see if it changed
     float c_prev = 0.0f;
-
-    Dsp::Params biquad_params;
-
+    
+    FastBiquadFilter<BiquadMode::Lowpass> fast_biquad;
+    
+    float gr_out = 0;
+    
 
     // Constructor: Initialize module and history buffer
     FirstCompressorModule() {
@@ -83,23 +73,14 @@ struct FirstCompressorModule : Module {
         configParam(PARAM_Q, 0.1f, 100.f, 10.f, "Q");
         configParam(PARAM_S, 1.f, 100.f, 2.f, "S");
         configParam(PARAM_T, -48.f, 12.f, -12.f, "T");
-        configParam(PARAM_C, 2.f, 10000.f, 100.f, "C");
+        configParam(PARAM_C, 0.1f, 1000.f, 10.f, "C");
+        configParam(PARAM_R, 0.5f, 100.0f, 0.707f, "R");
         configParam(PARAM_B, 0.f, 1.f, 0.f, "B");
 
-
-        biquad_input_L.setParameters(dsp::TBiquadFilter<double>::Type::LOWPASS,  biquad_cutoff, biquad_Q, biquad_gain);
-        biquad_input_R.setParameters(dsp::TBiquadFilter<double>::Type::LOWPASS,  biquad_cutoff, biquad_Q, biquad_gain);
-
-        biquad_L = new Dsp::SmoothedFilterDesign
-                <Dsp::RBJ::Design::LowPass, 1> (1024*OVERSAMPLE);
-        biquad_R = new Dsp::SmoothedFilterDesign
-                <Dsp::RBJ::Design::LowPass, 1> (1024*OVERSAMPLE);
-
-        biquad_params[0] = 48000*static_cast<double>(OVERSAMPLE); // sample rate
-        biquad_params[1] = 100; // cutoff frequency
-        biquad_params[2] = 0.5; // Q
-        biquad_L->setParams (biquad_params);
-        biquad_R->setParams (biquad_params);
+        // Configure sample rate or other parameters
+        fast_biquad.sampleRate       = 48000.0;
+        fast_biquad.freqTarget       = 0.1;
+        fast_biquad.resonanceTarget  = 0.707;
 
         aa_filter_L.setup (8,    // order
             48000.*static_cast<double>(OVERSAMPLE),// sample rate
@@ -119,51 +100,7 @@ struct FirstCompressorModule : Module {
         
         output_x[0] = new float[OVERSAMPLE];
         output_y[0] = new float[OVERSAMPLE];
-
-        // format required by library
-        biquad_out_L[0] = new float[1];
-        biquad_out_R[0] = new float[1];
     }
-
-    // https://www.desmos.com/calculator/iki5uxzlfo
-    // gain reduction function converted to log-sum-exp form to avoid overflow
-    // x should be >= 0
-    // S should be 1 <= S <= 100
-    // T should be -48 <= T <= 12
-    // k should be 0.1 <= k <= 10
-    /*static double gainReduction(double x, double k, double S, double T) {
-        if (x < 1.e-12) {
-            return 1.;
-        }
-        const double LN10 = std::log(10.);
-        double lz = 20. * k * std::log(x) - k * T * LN10;
-        double lp;
-        if (lz > 0) {
-            lp = lz + std::log1p(std::exp(-lz));
-        } else {
-            lp = std::log1p(std::exp(lz));
-        }
-        return std::exp(-lp / (20.*S*k));
-    }*/
-    
-    /*static double gainReduction(double x, double k, double S, double T) {
-        if (x < 1.e-12) {
-            return 1.;
-        }
-        const double LN10 = 2.30258509299; // ln(10)
-        //double lz = 20. * k * std::log(x) - k * T * LN10;
-        double lz = 20. * k * fast_log(x) - k * T * LN10;
-        double lp;
-        if (lz > 0) {
-            //lp = lz + std::log1p(std::exp(-lz));
-            lp = lz + softplusLUT.get(-lz); 
-        } else {
-            //lp = std::log1p(std::exp(lz));
-            lp = softplusLUT.get(lz);
-        }
-        //return std::exp(-lp / (20.*S*k));
-        return fast_exp(-lp / (20.*S*k));
-    }*/
     
     static inline float gainReduction(float x, float k, float S, float T) {
         if (x < 1.e-12f) {
@@ -179,40 +116,12 @@ struct FirstCompressorModule : Module {
         }
         return fast_exp(-lp / (20.f*S*k));
     }
-
-    // Q should vary between 1 and 100
-    // B should vary between 0 and 1
-    // this is ln(cosh(x*Q))/Q but modified to avoid overflow
-    /*static double softAbs(double x, double Q, double B) {
-        const double LN2 = log(2.);
-        double M = std::abs(x * Q);
-        //return (M + std::log1p(std::exp(-2.*M)) - LN2) / Q;
-        return B*(1. + std::tanh(Q*x)) + (M + std::log1p(std::exp(-2.*M)) - LN2) / Q;
-    }*/
-    
-    /*static inline double softAbs(double x, double Q, double B) {
-        const double LN2 = 0.69314718056; //ln(2)
-        double M = std::abs(x * Q);
-        //return (M + std::log1p(std::exp(-2.*M)) - LN2) / Q;
-        //return B*(1. + tanhLUT.get(Q*x)) + (M + softplusLUT.get(-2.*M) - LN2) / Q;
-        return (M + softplusLUT.get(-2.*M) - LN2) / Q;
-    }*/
     
     static inline float softAbs(float x, float Q, float B) {
         const float LN2 = 0.69314718056; //ln(2)
         float M = std::abs(x * Q);
         //return (M + std::log1p(std::exp(-2.*M)) - LN2) / Q;
-        //return B*(1. + tanhLUT.get(Q*x)) + (M + softplusLUT.get(-2.*M) - LN2) / Q;
         return B*(1. + tanhLUT.get(Q*x)) + (M + softplusLUT.get(-2.*M) - LN2) / Q;
-    }
-
-    double compressor(double x, double Q, double k, double S, double T, double B, double cutoff, Dsp::Filter* biquad, float** biquad_out) {
-        // there's no feedback here, so each stage of this could be batched
-        double absR = softAbs(x, Q, B);
-        //biquad_out[0][0] = static_cast<float>(absR);
-        //biquad->process(1, biquad_out);
-        double bqR = absR;//biquad_out[0][0];
-        return x * gainReduction(bqR, k, S, T);
     }
 
     void compute(
@@ -223,7 +132,8 @@ struct FirstCompressorModule : Module {
             double S,
             double T,
             double B,
-            double cutoff
+            double cutoff,
+            double R
             ) {
         out_L = 0.;
         out_R = 0.;
@@ -246,15 +156,14 @@ struct FirstCompressorModule : Module {
             output_y[0][i] = softAbs(input_y[0][i], Q, B);
         }
         
-        for (int i = 0; i < OVERSAMPLE; i++) {
-            slew_prev_L =  math::crossfade(slew_prev_L, output_x[0][i], cutoff / 10000.f);
-            output_x[0][i] = slew_prev_L;
-            slew_prev_R =  math::crossfade(slew_prev_R, output_y[0][i], cutoff / 10000.f);
-            output_y[0][i] = slew_prev_R;
-        }
-        
-        //biquad_L->process(OVERSAMPLE, output_x);
-        //biquad_R->process(OVERSAMPLE, output_y);
+        fast_biquad.freqTarget = cutoff / 48000.;
+        fast_biquad.resonanceTarget = R;
+        // remember to substitute tan LUT
+        fast_biquad.processBlock(output_x[0], output_y[0], output_x[0], output_y[0], OVERSAMPLE);
+    
+        // to show the GR signal
+        gr_out = gainReduction(output_x[0][0], k, S, T);
+        //gr_out = output_x[0][8];
         
         for (int i = 0; i < OVERSAMPLE; i++) {
             output_x[0][i] = input_x[0][i] * gainReduction(output_x[0][i], k, S, T);
@@ -273,11 +182,6 @@ struct FirstCompressorModule : Module {
         out_R /= static_cast<float>(OVERSAMPLE);
     }
 
-    /**
-     * process
-     *
-     * Called by VCV Rack to process audio every sample.
-     */
     void process(const ProcessArgs &args) override {
         // Step 1: Read the current input voltage
         float input_x = inputs[INPUT_X].getVoltage();
@@ -300,37 +204,20 @@ struct FirstCompressorModule : Module {
         float t = params[PARAM_T].getValue();
         float c = params[PARAM_C].getValue();
         float b = params[PARAM_B].getValue();
+        float r = params[PARAM_R].getValue();
 
-        if (c_prev != c) {
-            //biquad_input_L.setParameters(dsp::TBiquadFilter<double>::Type::LOWPASS, c, biquad_Q, biquad_gain);
-            //biquad_input_R.setParameters(dsp::TBiquadFilter<double>::Type::LOWPASS, c, biquad_Q, biquad_gain);
-            biquad_params[1] = c; // cutoff frequency
-            biquad_L->setParams(biquad_params);
-            biquad_R->setParams(biquad_params);
-        }
-
-
-        compute(history_x, history_y, q, k, s, t, b, c);
+        compute(history_x, history_y, q, k, s, t, b, c, r);
 
         // Step 4: Set the output voltage based on y0
         outputs[OUTPUT_L].setVoltage(out_L);
         outputs[OUTPUT_R].setVoltage(out_R);
+        outputs[OUTPUT_G].setVoltage(gr_out);
     }
 };
 
 //////////////////////////
 // Module Widget
 //////////////////////////
-
-/**
- * FirstCompressorWidget
- *
- * The GUI widget for the FirstCompressorModule.
- * struct WaterTableWidget : ModuleWidget {
-	WaterTableWidget(WaterTable* module) {
-		setModule(module);
-		setPanel(APP->window->loadSvg(asset::plugin(pluginInstance, "res/WaterTable.svg")));
- */
 struct FirstCompressorWidget : ModuleWidget {
     FirstCompressorWidget(FirstCompressorModule *module) {
         setModule(module);
@@ -347,13 +234,15 @@ struct FirstCompressorWidget : ModuleWidget {
         // Output Port
         addOutput(createOutputCentered<PJ301MPort>(Vec(10, 70), module, FirstCompressorModule::OUTPUT_L));
         addOutput(createOutputCentered<PJ301MPort>(Vec(10, 90), module, FirstCompressorModule::OUTPUT_R));
+        addOutput(createOutputCentered<PJ301MPort>(Vec(10, 330), module, FirstCompressorModule::OUTPUT_G));
 
         addParam(createParamCentered<VektronixSmallKnobDark>(Vec(10, 120), module, FirstCompressorModule::PARAM_K));
-        addParam(createParamCentered<VektronixSmallKnobDark>(Vec(10, 160), module, FirstCompressorModule::PARAM_Q));
-        addParam(createParamCentered<VektronixSmallKnobDark>(Vec(10, 200), module, FirstCompressorModule::PARAM_S));
-        addParam(createParamCentered<VektronixSmallKnobDark>(Vec(10, 240), module, FirstCompressorModule::PARAM_T));
-        addParam(createParamCentered<VektronixSmallKnobDark>(Vec(10, 280), module, FirstCompressorModule::PARAM_C));
-        addParam(createParamCentered<VektronixSmallKnobDark>(Vec(10, 320), module, FirstCompressorModule::PARAM_B));
+        addParam(createParamCentered<VektronixSmallKnobDark>(Vec(10, 140), module, FirstCompressorModule::PARAM_Q));
+        addParam(createParamCentered<VektronixSmallKnobDark>(Vec(10, 160), module, FirstCompressorModule::PARAM_S));
+        addParam(createParamCentered<VektronixSmallKnobDark>(Vec(10, 180), module, FirstCompressorModule::PARAM_T));
+        addParam(createParamCentered<VektronixSmallKnobDark>(Vec(10, 200), module, FirstCompressorModule::PARAM_C));
+        addParam(createParamCentered<VektronixSmallKnobDark>(Vec(10, 220), module, FirstCompressorModule::PARAM_R));
+        addParam(createParamCentered<VektronixSmallKnobDark>(Vec(10, 240), module, FirstCompressorModule::PARAM_B));
     }
 };
 

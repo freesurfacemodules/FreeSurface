@@ -9,10 +9,12 @@ using namespace rack;
 #endif
 
 // Constants
-const int BUFFER_SIZE = 2048;
+const int BUFFER_SIZE = 4096;
 const float BASE_DELAY = 179.0f;
 const float PHI = 1.618f;
 const int NUM_TAPS = 4;
+const float MAX_BASE_DELAY = 511; // (BUFFER_SIZE / (MAX_INTERVAL^3)) - 1
+const float MAX_INTERVAL = 2;
 
 // ---------------------------------------------------------------------------
 // Simple POD struct for complex numbers
@@ -104,7 +106,7 @@ struct DelayTap {
     ThiranAllpass filter;    // Thiran filter for fractional delay
 
     // Constructor: delaySamples is integer part; fractionalDelay is the fractional part.
-    DelayTap(int delaySamples, float fractionalDelay)
+    DelayTap(int delaySamples = 179, float fractionalDelay = 0.f)
         : delaySamples(delaySamples),
           filter(fractionalDelay) { }
 
@@ -126,6 +128,13 @@ struct DelayTap {
     void setFractionalDelay(float fractionalDelay) {
         filter.setFractionalDelay(fractionalDelay);
     }
+    
+    void setDelay(float delay) {
+        int intDelay = (int)floorf(delay);
+        float fracDelay = delay - intDelay;
+        delaySamples = intDelay;
+        filter.setFractionalDelay(fracDelay);
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -137,7 +146,7 @@ struct OnePoleLPF {
     float a; // Coefficient (smoothing factor)
     Complex prevOutput;
 
-    OnePoleLPF(float cutoff, float sampleRate) {
+    OnePoleLPF(float cutoff = 20000.f, float sampleRate = 48000.f) {
         setCutoff(cutoff, sampleRate);
         prevOutput = { 0.0f, 0.0f };
     }
@@ -197,7 +206,7 @@ static void updateUnitaryMatrix(const float theta[NUM_TAPS], Complex U[NUM_TAPS]
 // Feedback Delay Network (FDN) Reverb class.
 struct FDNReverb {
     // Four delay taps.
-    DelayTap* taps[NUM_TAPS];
+    DelayTap taps[NUM_TAPS];
     // 4x4 unitary matrix.
     Complex U[NUM_TAPS][NUM_TAPS];
     // Four phase parameters (controlled by knobs, range 0 to 2pi).
@@ -206,16 +215,21 @@ struct FDNReverb {
     float fbscale = 0.9;
     
     // One-pole lowpass filters on the feedback path.
-    OnePoleLPF* lpf[NUM_TAPS];
+    OnePoleLPF lpf[NUM_TAPS];
     // Sample rate (in Hz) used for filter coefficient calculation.
     float sampleRate;
     // Cutoff frequency for the LPF (in Hz).
     float lpfCutoff;
     
     float baseDelay = BASE_DELAY;
+    float interval = PHI;
 
     // Constructor: initialize taps and unitary matrix.
-    FDNReverb(float base_delay = BASE_DELAY, float sampleRate_ = 44100.0f, float cutoff = 5000.0f) : sampleRate(sampleRate_), lpfCutoff(cutoff) {
+    FDNReverb(float base_delay = BASE_DELAY, float sampleRate_ = 44100.0f, float cutoff = 5000.0f, float interval_ = PHI) : 
+            sampleRate(sampleRate_), 
+            lpfCutoff(cutoff),
+            interval(interval_)
+        {
         // Initialize theta to default values (e.g., 0 radians).
         for (int i = 0; i < NUM_TAPS; i++) {
             theta[i] = 0.0f;
@@ -225,10 +239,8 @@ struct FDNReverb {
         // Delay = BASE_DELAY * phi^(tap_number)
         // Integer part is floor(delay), fractional part is delay - floor(delay).
         for (int i = 0; i < NUM_TAPS; i++) {
-            float delay = base_delay * powf(PHI, i);
-            int intDelay = (int)floorf(delay);
-            float fracDelay = delay - intDelay;
-            taps[i] = new DelayTap(intDelay, fracDelay);
+            float delay = base_delay * powf(interval, i);
+            taps[i].setDelay(delay);
         }
 
         // Initialize the unitary matrix.
@@ -237,25 +249,16 @@ struct FDNReverb {
         
         // Initialize one-pole LPF for each feedback path.
         for (int i = 0; i < NUM_TAPS; i++) {
-            lpf[i] = new OnePoleLPF(lpfCutoff, sampleRate);
+            lpf[i].setCutoff(lpfCutoff, sampleRate);
         }
     }
     
-    void setBaseDelay(float base_delay) {
-        baseDelay = base_delay;
+    void setBaseDelay(float baseDelay_, float interval_) {
+        baseDelay = baseDelay_;
+        interval = interval_;
         for (int i = 0; i < NUM_TAPS; i++) {
-            float delay = base_delay * powf(PHI, i);
-            int intDelay = (int)floorf(delay);
-            float fracDelay = delay - intDelay;
-            taps[i]->setDelay(delay);
-            taps[i]->setFractionalDelay(fracDelay);
-        }
-    }
-
-    ~FDNReverb() {
-        for (int i = 0; i < NUM_TAPS; i++) {
-            delete taps[i];
-            delete lpf[i];
+            float delay = baseDelay * powf(interval, i);
+            taps[i].setDelay(delay);
         }
     }
 
@@ -267,21 +270,25 @@ struct FDNReverb {
         }
     }
     
-    // Set the one-pole lowpass filter cutoff frequency (in Hz).
-    void setLPFCutoff(float cutoff) {
-        lpfCutoff = cutoff;
-        for (int i = 0; i < NUM_TAPS; i++) {
-            lpf[i]->setCutoff(lpfCutoff, sampleRate);
-        }
-    }
-    
-    // Set one of the four phase parameters (knob input, in radians).
+    // Set all four phase parameters (knob input, in radians).
     void setTheta(float a, float b, float c, float d) {
         theta[0] = a;
         theta[1] = b;
         theta[2] = c;
         theta[3] = d;
         updateUnitaryMatrix(theta, U);
+    }
+    
+    void setInterval(float interval_) {
+        setBaseDelay(baseDelay, interval_); // reset all derived delay lengths
+    }
+    
+    // Set the one-pole lowpass filter cutoff frequency (in Hz).
+    void setLPFCutoff(float cutoff) {
+        lpfCutoff = cutoff;
+        for (int i = 0; i < NUM_TAPS; i++) {
+            lpf[i].setCutoff(lpfCutoff, sampleRate);
+        }
     }
     
     void setFeedback(float f) {
@@ -300,7 +307,7 @@ struct FDNReverb {
         // 1. Get output from each delay tap.
         Complex tapOutputs[NUM_TAPS];
         for (int i = 0; i < NUM_TAPS; i++) {
-            tapOutputs[i] = taps[i]->getTap();
+            tapOutputs[i] = taps[i].getTap();
         }
 
         // 2. Multiply the 4-vector of tap outputs by the unitary matrix U.
@@ -314,7 +321,7 @@ struct FDNReverb {
         
         // 3. Process each feedback channel through its one-pole lowpass filter.
         for (int i = 0; i < NUM_TAPS; i++) {
-            feedback[i] = lpf[i]->process(feedback[i]);
+            feedback[i] = lpf[i].process(feedback[i]);
         }
 
         // 4. Feed back into the delay lines.
@@ -322,7 +329,7 @@ struct FDNReverb {
         // plus the corresponding feedback component.
         for (int i = 0; i < NUM_TAPS; i++) {
             Complex newSample = add(input, feedback[i]);
-            taps[i]->push(newSample);
+            taps[i].push(newSample);
         }
 
         // 5. Compute the output by taking the dot product of the feedback vector with (1,1,1,1)
@@ -338,13 +345,18 @@ struct FDNReverb {
 struct PhiReverbModule : Module {
     // Enum identifiers for Params, Inputs, Outputs, Lights
     enum ParamIds {
-        PARAM_K,
-        PARAM_Q,
-        PARAM_S,
+        PARAM_R0,
+        PARAM_R1,
+        PARAM_R2,
+        PARAM_R3,
         PARAM_T,
-        PARAM_C,
-        PARAM_R,
-        PARAM_B,
+        PARAM_F,
+        PARAM_D0,
+        PARAM_D1,
+        PARAM_D2,
+        PARAM_I0,
+        PARAM_I1,
+        PARAM_I2,
         NUM_PARAMS
     };
     enum InputIds {
@@ -355,7 +367,6 @@ struct PhiReverbModule : Module {
     enum OutputIds {
         OUTPUT_L,
         OUTPUT_R,
-        OUTPUT_G,
         NUM_OUTPUTS
     };
     enum LightIds {
@@ -372,48 +383,110 @@ struct PhiReverbModule : Module {
     // Constructor: Initialize module and history buffer
     PhiReverbModule() {
         config(NUM_PARAMS, NUM_INPUTS, NUM_OUTPUTS, NUM_LIGHTS);
-        configParam(PARAM_K, -M_PI, M_PI, 0.5f, "K");
-        configParam(PARAM_Q, -M_PI, M_PI, 10.f, "Q");
-        configParam(PARAM_S, -M_PI, M_PI, 2.f, "S");
-        configParam(PARAM_T, -M_PI, M_PI, -12.f, "T");
-        configParam(PARAM_C, 0.0f, 0.9999f, 0.9f, "C");
-        configParam(PARAM_R, 1.0f, 20000.0f, 10000.0f, "R");
-        configParam(PARAM_B, 0.f, 1.f, 0.f, "B");
+        configParam(PARAM_R0, -M_PI, M_PI, 0.5f, "K");
+        configParam(PARAM_R1, -M_PI, M_PI, 10.f, "Q");
+        configParam(PARAM_R2, -M_PI, M_PI, 2.f, "S");
+        configParam(PARAM_R3, -M_PI, M_PI, -12.f, "T");
+        configParam(PARAM_T, 0.0f, 0.99999f, 0.9f, "C");
+        configParam(PARAM_F, 1.0f, 20000.0f, 10000.0f, "R");
+        configParam(PARAM_D0, 0.f, MAX_BASE_DELAY, 179.f, "D0");
+        configParam(PARAM_D1, 0.f, MAX_BASE_DELAY, 239.f, "D1");
+        configParam(PARAM_D2, 0.f, MAX_BASE_DELAY, 419.f, "D2");
+        configParam(PARAM_I0, 0.f, MAX_INTERVAL, PHI, "I0");
+        configParam(PARAM_I1, 0.f, MAX_INTERVAL, PHI, "I1");
+        configParam(PARAM_I2, 0.f, MAX_INTERVAL, PHI, "I2");
     }
     
+    float r0_prev = 0.f;
+    float r1_prev = 0.f;
+    float r2_prev = 0.f;
+    float r3_prev = 0.f;
+    
+    float d0_prev = 0.f;
+    float d1_prev = 0.f;
+    float d2_prev = 0.f;
+    
+    float i0_prev = 0.f;
+    float i1_prev = 0.f;
+    float i2_prev = 0.f;
+    
+    float f_prev = 0.f;
+    float t_prev = 0.f;
 
     void process(const ProcessArgs &args) override {
         // Step 1: Read the current input voltage
         float input_x = inputs[INPUT_X].getVoltage();
 
-        float k = params[PARAM_K].getValue();
-        float q = params[PARAM_Q].getValue();
-        float s = params[PARAM_S].getValue();
-        float t = params[PARAM_T].getValue();
-        float c = params[PARAM_C].getValue();
-        float r = params[PARAM_R].getValue();
-
-        reverb0.setTheta(k, q, s, t);
-        reverb0.setLPFCutoff(r);
-        reverb0.setFeedback(c);
-        reverb1.setTheta(k, q, s, t);
-        reverb1.setLPFCutoff(r);
-        reverb1.setFeedback(c);
-        reverb2.setTheta(k, q, s, t);
-        reverb2.setLPFCutoff(r);
-        reverb2.setFeedback(c);
+        float r0 = params[PARAM_R0].getValue();
+        float r1 = params[PARAM_R1].getValue();
+        float r2 = params[PARAM_R2].getValue();
+        float r3 = params[PARAM_R3].getValue();
         
-        float sf = (1.0f - c)/0.08;
+        float t = params[PARAM_T].getValue();
+        float f = params[PARAM_F].getValue();
+        
+        float d0 = params[PARAM_D0].getValue();
+        float d1 = params[PARAM_D1].getValue();
+        float d2 = params[PARAM_D2].getValue();
+        float i0 = params[PARAM_I0].getValue();
+        float i1 = params[PARAM_I1].getValue();
+        float i2 = params[PARAM_I2].getValue();
+        
+        if (r0_prev != r0 || r1_prev != r1 || r2_prev != r2 || r3_prev != r3) {
+            reverb0.setTheta(r0, r1, r2, r3);
+            reverb1.setTheta(r0, r1, r2, r3);
+            reverb2.setTheta(r0, r1, r2, r3);
+        }
+        
+        if (d0_prev != d0 || i0_prev != i0) {
+            reverb0.setBaseDelay(d0, i0);
+        }
+        
+        if (d1_prev != d1 || i1_prev != i1) {
+            reverb1.setBaseDelay(d1, i1);
+        }
+        
+        if (d2_prev != d2 || i2_prev != i2) {
+            reverb2.setBaseDelay(d2, i2);
+        }
+        
+        if (t_prev != t) {
+            reverb0.setFeedback(t);     
+            reverb1.setFeedback(t);    
+            reverb2.setFeedback(t);       
+        }
+        
+        if (f_prev != f) {
+            reverb0.setLPFCutoff(f);
+            reverb1.setLPFCutoff(f);  
+            reverb2.setLPFCutoff(f);            
+        }
+
+        float sf = (1.0f - t)/0.08; // need to figure out a better empirical scaling relationship
         
         Complex result0 = reverb0.processSample(input_x);
         Complex result1 = reverb1.processSample(input_x);
         Complex result2 = reverb2.processSample(scale(add(result0,result1), sf));
         
-        
-
         // Step 4: Set the output voltage based on y0
         outputs[OUTPUT_L].setVoltage(sf * result2.real);
         outputs[OUTPUT_R].setVoltage(sf * result2.imag);
+        
+        r0_prev = r0;
+        r1_prev = r1;
+        r2_prev = r2;
+        r3_prev = r3;
+    
+        d0_prev = d0;
+        d1_prev = d1;
+        d2_prev = d2;
+    
+        i0_prev = i0;
+        i1_prev = i1;
+        i2_prev = i2;
+    
+        t_prev = t;
+        f_prev = f;
 
     }
 };
@@ -430,22 +503,25 @@ struct PhiReverbWidget : ModuleWidget {
 
         // Input Port
         addInput(createInputCentered<PJ301MPort>(Vec(10, 30), module, PhiReverbModule::INPUT_X));
-
-        // Input Port
         addInput(createInputCentered<PJ301MPort>(Vec(10, 50), module, PhiReverbModule::INPUT_Y));
 
         // Output Port
         addOutput(createOutputCentered<PJ301MPort>(Vec(10, 70), module, PhiReverbModule::OUTPUT_L));
         addOutput(createOutputCentered<PJ301MPort>(Vec(10, 90), module, PhiReverbModule::OUTPUT_R));
-        addOutput(createOutputCentered<PJ301MPort>(Vec(10, 330), module, PhiReverbModule::OUTPUT_G));
 
-        addParam(createParamCentered<VektronixSmallKnobDark>(Vec(10, 120), module, PhiReverbModule::PARAM_K));
-        addParam(createParamCentered<VektronixSmallKnobDark>(Vec(10, 140), module, PhiReverbModule::PARAM_Q));
-        addParam(createParamCentered<VektronixSmallKnobDark>(Vec(10, 160), module, PhiReverbModule::PARAM_S));
-        addParam(createParamCentered<VektronixSmallKnobDark>(Vec(10, 180), module, PhiReverbModule::PARAM_T));
-        addParam(createParamCentered<VektronixSmallKnobDark>(Vec(10, 200), module, PhiReverbModule::PARAM_C));
-        addParam(createParamCentered<VektronixSmallKnobDark>(Vec(10, 220), module, PhiReverbModule::PARAM_R));
-        addParam(createParamCentered<VektronixSmallKnobDark>(Vec(10, 240), module, PhiReverbModule::PARAM_B));
+        addParam(createParamCentered<VektronixSmallKnobDark>(Vec(10, 120), module, PhiReverbModule::PARAM_R0));
+        addParam(createParamCentered<VektronixSmallKnobDark>(Vec(10, 140), module, PhiReverbModule::PARAM_R1));
+        addParam(createParamCentered<VektronixSmallKnobDark>(Vec(10, 160), module, PhiReverbModule::PARAM_R2));
+        addParam(createParamCentered<VektronixSmallKnobDark>(Vec(10, 180), module, PhiReverbModule::PARAM_R3));
+        addParam(createParamCentered<VektronixSmallKnobDark>(Vec(10, 200), module, PhiReverbModule::PARAM_T));
+        addParam(createParamCentered<VektronixSmallKnobDark>(Vec(10, 220), module, PhiReverbModule::PARAM_F));
+        
+        addParam(createParamCentered<VektronixSmallKnobDark>(Vec(10, 240), module, PhiReverbModule::PARAM_D0));
+        addParam(createParamCentered<VektronixSmallKnobDark>(Vec(10, 260), module, PhiReverbModule::PARAM_D1));
+        addParam(createParamCentered<VektronixSmallKnobDark>(Vec(10, 280), module, PhiReverbModule::PARAM_D2));
+        addParam(createParamCentered<VektronixSmallKnobDark>(Vec(10, 300), module, PhiReverbModule::PARAM_I0));
+        addParam(createParamCentered<VektronixSmallKnobDark>(Vec(10, 320), module, PhiReverbModule::PARAM_I1));
+        addParam(createParamCentered<VektronixSmallKnobDark>(Vec(10, 340), module, PhiReverbModule::PARAM_I2));
     }
 };
 

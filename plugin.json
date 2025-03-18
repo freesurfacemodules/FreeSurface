@@ -1,6 +1,6 @@
 {
   "slug": "FreeSurface",
-  "version": "2.1.3",
+  "version": "2.1.4",
   "license": "GPL-3.0-only",
   "name": "Causal Systems",
   "brand": "Free Surface",
@@ -39,6 +39,12 @@
     {
       "slug": "FreeSurface-PhiReverb",
       "name": "PhiReverb",
+      "description": "Physical modeling system with a fully analog design",
+      "tags": ["Distortion", "Filter", "Panning", "Ring modulator", "Physical modeling"]
+    },
+    {
+      "slug": "FreeSurface-KalmanPitchTracker",
+      "name": "KalmanPitchTracker",
       "description": "Physical modeling system with a fully analog design",
       "tags": ["Distortion", "Filter", "Panning", "Ring modulator", "Physical modeling"]
     }

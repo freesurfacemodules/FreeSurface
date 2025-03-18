@@ -18,4 +18,5 @@ extern Model* modelWaterTable2;
 extern Model* modelStereoToMonoFFT;
 extern Model* modelFirstCompressor;
 extern Model* modelPhiReverb;
+extern Model* modelKalmanPitchTracker;
 
