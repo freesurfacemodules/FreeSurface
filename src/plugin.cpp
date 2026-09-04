@@ -13,4 +13,5 @@ void init(rack::Plugin* p) {
     p->addModel(modelFirstCompressor);
     p->addModel(modelPhiReverb);
     p->addModel(modelKalmanPitchTracker);
+    p->addModel(modelKronVerb);
 }

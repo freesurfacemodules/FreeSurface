@@ -19,4 +19,5 @@ extern Model* modelStereoToMonoFFT;
 extern Model* modelFirstCompressor;
 extern Model* modelPhiReverb;
 extern Model* modelKalmanPitchTracker;
+extern Model* modelKronVerb;
 
