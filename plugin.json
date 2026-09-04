@@ -92,6 +92,15 @@
         "Reverb",
         "Effect"
       ]
+    },
+    {
+      "slug": "FreeSurface-LG57",
+      "name": "LG57",
+      "description": "Alias-free polynomial saturator: 4x local/guard pipeline LG57 from the polydist Pareto study",
+      "tags": [
+        "Distortion",
+        "Waveshaper"
+      ]
     }
   ]
 }
