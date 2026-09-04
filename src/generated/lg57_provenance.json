@@ -1,0 +1,14 @@
+{
+  "matrix_code": "LG57",
+  "config": "cross_centered.firls_l199.exact_structure.X3.midpoint_centered.smoothstep_d7_naive.exact_halfband_110.guard_140.phase_fused_paired",
+  "cpp_type": "Config_cross_centered_firls_l199_exact_structure_X3_midpoint_centered_smoothstep_d7_naive_exact_halfband_110_guard_140_phase_fused_paired_c5deca89",
+  "semantic_id": "local4x:0735e32f05555755",
+  "config_id": "native:4b9c94e3c5deca89",
+  "source_commit": "c26f96b",
+  "method": "R4 | in:FIR-LS 199t | mid:exact-stage 14t centered | core:pw | dec:HB A110 | out:HB A140",
+  "fidelity_avg_db": 128.3055749748366,
+  "fidelity_worst_db": 122.67731898890843,
+  "spur_avg_db": 152.90282442254903,
+  "zen3_cycles_per_sample": 31.8972,
+  "design_sample_rate_hz": 48000
+}

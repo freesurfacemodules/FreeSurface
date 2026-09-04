@@ -20,4 +20,5 @@ extern Model* modelFirstCompressor;
 extern Model* modelPhiReverb;
 extern Model* modelKalmanPitchTracker;
 extern Model* modelKronVerb;
+extern Model* modelLG57;
 
