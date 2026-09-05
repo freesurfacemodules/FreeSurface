@@ -245,6 +245,7 @@ struct KronVerbModule : Module {
         PARAM_WIDTH,
         PARAM_MIX,
         PARAM_DRIFT,
+        PARAM_MIRROR,
         NUM_PARAMS
     };
     enum InputIds {
@@ -258,6 +259,7 @@ struct KronVerbModule : Module {
         CV_SHIMMER,
         CV_FREEZE,
         CV_PITCH,
+        CV_MIRROR,
         NUM_INPUTS
     };
     enum OutputIds {
@@ -282,7 +284,7 @@ struct KronVerbModule : Module {
     float driftPhase1 = 0.f;
     float driftPhase2 = 0.f;
 
-    Smoother smSize, smFreeze, smDiffuse, smShimmer, smWarp, smWidth, smMix, smDrift;
+    Smoother smSize, smFreeze, smDiffuse, smShimmer, smWarp, smWidth, smMix, smDrift, smMirror;
 
     // Output sign pattern: balanced (+/-), orthogonal to the all-ones input
     // vector, so the dry first pass doesn't feed straight through.
@@ -305,6 +307,7 @@ struct KronVerbModule : Module {
         configParam(PARAM_WIDTH, 0.f, 1.f, 1.f, "Width");
         configParam(PARAM_MIX, 0.f, 1.f, 0.35f, "Mix");
         configParam(PARAM_DRIFT, 0.f, 1.f, 0.f, "Drift");
+        configParam(PARAM_MIRROR, 0.f, 1.f, 0.f, "Mirror (sideband spread)");
 
         configInput(INPUT_L, "Left audio");
         configInput(INPUT_R, "Right audio");
@@ -316,6 +319,7 @@ struct KronVerbModule : Module {
         configInput(CV_SHIMMER, "Shimmer CV");
         configInput(CV_FREEZE, "Freeze CV");
         configInput(CV_PITCH, "Shimmer pitch CV");
+        configInput(CV_MIRROR, "Mirror CV");
         configOutput(OUTPUT_L, "Left audio");
         configOutput(OUTPUT_R, "Right audio");
         configBypass(INPUT_L, OUTPUT_L);
@@ -334,6 +338,7 @@ struct KronVerbModule : Module {
         smWidth.setTau(0.01f, fs);
         smMix.setTau(0.01f, fs);
         smDrift.setTau(0.05f, fs);
+        smMirror.setTau(0.01f, fs);
     }
 
     float macro(int paramId, int cvId, float lo = 0.f, float hi = 1.f) {
@@ -359,6 +364,7 @@ struct KronVerbModule : Module {
         float width = smWidth.process(params[PARAM_WIDTH].getValue());
         float mix = smMix.process(params[PARAM_MIX].getValue());
         float drift = smDrift.process(params[PARAM_DRIFT].getValue());
+        float mirror = smMirror.process(macro(PARAM_MIRROR, CV_MIRROR));
 
         float t60 = 0.1f * std::pow(600.f, decay);          // 0.1 s .. 60 s
         float dampFc = 200.f * std::pow(100.f, dampV);      // 200 Hz .. 20 kHz
@@ -394,11 +400,30 @@ struct KronVerbModule : Module {
         mixer.setRotation(2, thetaBase + driftAmt * std::sin(driftPhase2));
         mixer.setRotation(3, thetaBase);
 
-        // -- Uniform phasor: exact SSB frequency shift per loop pass ---------
+        // -- Phasor layer: weighted sideband pair per loop pass --------------
+        // z = cos(psi) + i*lambda*sin(psi) = (1+lambda)/2 e^{i psi}
+        //                                  + (1-lambda)/2 e^{-i psi}.
+        // lambda = 1 (MIRROR = 0): pure SSB shift, unimodular -- the spectrum
+        // advects by shiftHz per pass.  lambda = 0 (MIRROR = 1): true DSB ring
+        // mod -- each pass convolves the spectrum with {+shift, -shift}, so it
+        // diffuses (binomial spread) instead of drifting.  Deliberately NO
+        // power make-up: the paper's sqrt(2) ring-mod scaling is parametrically
+        // unstable inside the loop (packets whose loop period resonates with
+        // the modulation cross repeatedly near the cos peaks and pump without
+        // bound -- confirmed in the core tests), whereas |z| <= 1 keeps the
+        // tank unconditionally stable; MIRROR trades a little tail energy for
+        // the spectral diffusion, which lives in the convolution, not the
+        // gain.  The frozen (even) partition crossfades back to pure SSB as
+        // freeze rises, since its losslessness needs a unimodular phasor.
         psi += 2.f * (float)M_PI * shiftHz / fs;
         if (psi > (float)M_PI) psi -= 2.f * (float)M_PI;
         if (psi < -(float)M_PI) psi += 2.f * (float)M_PI;
-        Cplx z = {std::cos(psi), std::sin(psi)};
+        float cps = std::cos(psi);
+        float sps = std::sin(psi);
+        float lamOdd = 1.f - mirror;
+        float lamEven = 1.f - mirror * (1.f - freeze);
+        Cplx zOdd = {cps, lamOdd * sps};
+        Cplx zEven = {cps, lamEven * sps};
 
         // -- Damping coefficient ---------------------------------------------
         float dampA = std::exp(-2.f * (float)M_PI * dampFc / fs);
@@ -443,7 +468,7 @@ struct KronVerbModule : Module {
                 damped.re = damped.re + freeze * (tap.re - damped.re);
                 damped.im = damped.im + freeze * (tap.im - damped.im);
             }
-            v[i] = cscale(cmul(damped, z), g);
+            v[i] = cscale(cmul(damped, (i & 1) ? zOdd : zEven), g);
         }
 
         // -- Unitary mixing ---------------------------------------------------
@@ -514,6 +539,8 @@ struct KronVerbWidget : ModuleWidget {
         addParam(createParamCentered<VektronixSmallKnobDark>(Vec(col3, y0 + 1 * dy), module, KronVerbModule::PARAM_WIDTH));
         addParam(createParamCentered<VektronixSmallKnobDark>(Vec(col3, y0 + 2 * dy), module, KronVerbModule::PARAM_MIX));
         addParam(createParamCentered<VektronixSmallKnobDark>(Vec(col3, y0 + 3 * dy), module, KronVerbModule::PARAM_DRIFT));
+        addParam(createParamCentered<VektronixSmallKnobDark>(Vec(col2, y0 + 8 * dy), module, KronVerbModule::PARAM_MIRROR));
+        addInput(createInputCentered<PJ301MPort>(Vec(col1, y0 + 8 * dy), module, KronVerbModule::CV_MIRROR));
         addInput(createInputCentered<PJ301MPort>(Vec(col3, y0 + 4 * dy), module, KronVerbModule::CV_WARP));
         addInput(createInputCentered<PJ301MPort>(Vec(col3, y0 + 5 * dy), module, KronVerbModule::CV_SHIMMER));
         addInput(createInputCentered<PJ301MPort>(Vec(col3, y0 + 6 * dy), module, KronVerbModule::CV_FREEZE));
