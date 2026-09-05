@@ -159,6 +159,58 @@ struct KronMixer {
 };
 
 // ---------------------------------------------------------------------------
+// Dual-read-head shimmer transposer branch: two sawtooth taps with a
+// synchronized equal-power crossfade (sin^2 + cos^2 = 1), a DC blocker, and
+// pyFDN-style slow energy normalization (two power envelope followers and a
+// smoothed, capped sqrt(Pin/Pout) gain; cf. pyFDN td/operators.py DCBlocker
+// correct_loss).  The normalization is referenced to the static main tap the
+// branch blends against, making the branch power-neutral inside the loop:
+// time-compressed reads and correlated tap sums can no longer compound per
+// pass, so recirculation cannot run away for any shimmer setting.
+struct ShimmerTap {
+    float phase = 0.f;
+    Cplx dcX, dcY;
+    float inPow = 1e-12f, outPow = 1e-12f, comp = 1.f;
+
+    void resetState() {
+        inPow = outPow = 1e-12f;
+        comp = 1.f;
+        dcX = dcY = {0.f, 0.f};
+    }
+
+    // rate = (ratio - 1) / WIN per sample; ref is the static main tap whose
+    // power is the normalization target; aEnv/aGain are the per-sample
+    // envelope coefficients (50 ms / 20 ms time constants).
+    Cplx process(DelayLine& line, float baseDelay, float rate, float aEnv,
+                 float aGain, Cplx ref) {
+        phase -= rate;
+        phase -= std::floor(phase);
+        float pB = phase + 0.5f;
+        pB -= std::floor(pB);
+        float gA = std::sin((float)M_PI * phase);
+        float gB = std::sin((float)M_PI * pB);
+        Cplx sA = line.readCubic(baseDelay + (float)WIN * phase);
+        Cplx sB = line.readCubic(baseDelay + (float)WIN * pB);
+        Cplx sh = cadd(cscale(sA, gA), cscale(sB, gB));
+
+        // DC blocker y[n] = x[n] - x[n-1] + R y[n-1] on both components:
+        // recirculated grains can pile up near-DC content in the loop.
+        const float R = 0.995f;
+        Cplx y = {sh.re - dcX.re + R * dcY.re, sh.im - dcX.im + R * dcY.im};
+        dcX = sh;
+        dcY = y;
+
+        const float eps = 1e-12f;
+        inPow = aEnv * inPow + (1.f - aEnv) * (ref.re * ref.re + ref.im * ref.im);
+        outPow = aEnv * outPow + (1.f - aEnv) * (y.re * y.re + y.im * y.im);
+        float target = std::sqrt((inPow + eps) / (outPow + eps));
+        if (target > 4.f) target = 4.f;  // cap the boost; attenuation uncapped
+        comp = aGain * comp + (1.f - aGain) * target;
+        return cscale(y, comp);
+    }
+};
+
+// ---------------------------------------------------------------------------
 // One-pole parameter smoother.
 struct Smoother {
     float y = 0.f;
@@ -225,7 +277,7 @@ struct KronVerbModule : Module {
     float delaySamp[N] = {};   // current (slewed) delay per line, in samples
     int delayInt[N] = {};      // integer part handed to the buffer read
 
-    float shimPhase[N] = {};   // grain phase [0,1) per line (odd lines used)
+    ShimmerTap shim[N];        // shimmer branch state (odd lines used)
     float psi = 0.f;           // uniform phasor angle (SSB shift)
     float driftPhase1 = 0.f;
     float driftPhase2 = 0.f;
@@ -355,26 +407,23 @@ struct KronVerbModule : Module {
 
         // -- Read taps + per-line loop operations ----------------------------
         float shimRate = (ratio - 1.f) / (float)WIN;
+        float aEnv = std::exp(-1.f / (fs * 0.05f));   // 50 ms power envelopes
+        float aGain = std::exp(-1.f / (fs * 0.02f));  // 20 ms gain smoothing
         Cplx v[N];
         for (int i = 0; i < N; i++) {
             // Main tap: integer delay + Thiran allpass (lossless).
             Cplx tap = thiran[i].process(lines[i].readInt(delayInt[i]));
 
-            // Shimmer transposer on odd lines: two sawtooth read taps with a
-            // synchronized equal-power crossfade (sin^2 + cos^2 = 1).
-            if ((i & 1) && shimmer > 1e-4f) {
-                float pA = shimPhase[i] - shimRate;
-                pA -= std::floor(pA);
-                shimPhase[i] = pA;
-                float pB = pA + 0.5f;
-                pB -= std::floor(pB);
-                float gA = std::sin((float)M_PI * pA);
-                float gB = std::sin((float)M_PI * pB);
-                Cplx sA = lines[i].readCubic(delaySamp[i] + (float)WIN * pA);
-                Cplx sB = lines[i].readCubic(delaySamp[i] + (float)WIN * pB);
-                Cplx sh = cadd(cscale(sA, gA), cscale(sB, gB));
-                tap.re += shimmer * (sh.re - tap.re);
-                tap.im += shimmer * (sh.im - tap.im);
+            // Energy-normalized shimmer transposer branch on odd lines.
+            if (i & 1) {
+                if (shimmer > 1e-4f) {
+                    Cplx sh = shim[i].process(lines[i], delaySamp[i], shimRate,
+                                              aEnv, aGain, tap);
+                    tap.re += shimmer * (sh.re - tap.re);
+                    tap.im += shimmer * (sh.im - tap.im);
+                } else {
+                    shim[i].resetState();
+                }
             }
 
             // Kerr self-phase modulation: y = x * e^(i*k*|x|). |y| = |x|
