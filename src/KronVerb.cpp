@@ -286,12 +286,14 @@ struct KronVerbModule : Module {
 
     Smoother smSize, smFreeze, smDiffuse, smShimmer, smWarp, smWidth, smMix, smDrift, smMirror;
 
-    // Output sign pattern: balanced (+/-), orthogonal to the all-ones input
-    // vector, so the dry first pass doesn't feed straight through.
-    static constexpr int CSIGN[N] = {
-        +1, -1, +1, -1, -1, +1, -1, +1,
-        +1, -1, +1, -1, -1, +1, -1, +1
-    };
+    // Complex output weights, unit magnitude, golden-angle phase spread.
+    // The tank's lines carry strongly correlated content (structured mixing),
+    // and under MIRROR the relative phase between the SSB and mirrored halves
+    // sweeps slowly: a real +-1 output pattern lets the summed output drift
+    // through anti-phase and fade by 30+ dB.  Diverse fixed output phases make
+    // the sum behave incoherently (diffuse-field-like), holding the envelope
+    // within a few dB at any shift rate (verified in sim_mirror2).
+    Cplx cOut[N];
 
     KronVerbModule() {
         config(NUM_PARAMS, NUM_INPUTS, NUM_OUTPUTS, NUM_LIGHTS);
@@ -324,6 +326,11 @@ struct KronVerbModule : Module {
         configOutput(OUTPUT_R, "Right audio");
         configBypass(INPUT_L, OUTPUT_L);
         configBypass(INPUT_R, OUTPUT_R);
+
+        for (int i = 0; i < N; i++) {
+            float chi = 2.f * (float)M_PI * std::fmod(0.61803398875f * (float)i, 1.f);
+            cOut[i] = {std::cos(chi), std::sin(chi)};
+        }
 
         onSampleRateChange();
     }
@@ -413,17 +420,21 @@ struct KronVerbModule : Module {
         // bound -- confirmed in the core tests), whereas |z| <= 1 keeps the
         // tank unconditionally stable; MIRROR trades a little tail energy for
         // the spectral diffusion, which lives in the convolution, not the
-        // gain.  The frozen (even) partition crossfades back to pure SSB as
-        // freeze rises, since its losslessness needs a unimodular phasor.
+        // gain.  The mirrored component is applied to the ODD lines only,
+        // matching pyFDN's practice of ring-modulating a channel subset
+        // (active_channels = half the lines): gating every line with the same
+        // phase nulls the whole tank and output at each cos zero crossing
+        // (deep amplitude swings), while the ungated half carries the sound
+        // through the nulls.  The even lines stay pure SSB, which also keeps
+        // the freezable partition exactly unimodular for any MIRROR setting.
         psi += 2.f * (float)M_PI * shiftHz / fs;
         if (psi > (float)M_PI) psi -= 2.f * (float)M_PI;
         if (psi < -(float)M_PI) psi += 2.f * (float)M_PI;
         float cps = std::cos(psi);
         float sps = std::sin(psi);
         float lamOdd = 1.f - mirror;
-        float lamEven = 1.f - mirror * (1.f - freeze);
         Cplx zOdd = {cps, lamOdd * sps};
-        Cplx zEven = {cps, lamEven * sps};
+        Cplx zEven = {cps, sps};
 
         // -- Damping coefficient ---------------------------------------------
         float dampA = std::exp(-2.f * (float)M_PI * dampFc / fs);
@@ -482,8 +493,7 @@ struct KronVerbModule : Module {
 
         Cplx wet = {0.f, 0.f};
         for (int i = 0; i < N; i++) {
-            wet.re += (float)CSIGN[i] * v[i].re;
-            wet.im += (float)CSIGN[i] * v[i].im;
+            wet = cadd(wet, cmul(v[i], cOut[i]));
 
             float ing = bGain;
             if (!(i & 1))
@@ -502,8 +512,6 @@ struct KronVerbModule : Module {
         outputs[OUTPUT_R].setVoltage(dryG * inR + wetG * wetR);
     }
 };
-
-constexpr int KronVerbModule::CSIGN[];
 
 // ---------------------------------------------------------------------------
 struct KronVerbWidget : ModuleWidget {
