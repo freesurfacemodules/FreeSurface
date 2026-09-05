@@ -457,13 +457,23 @@ struct KronVerbModule : Module {
             // Main tap: integer delay + Thiran allpass (lossless).
             Cplx tap = thiran[i].process(lines[i].readInt(delayInt[i]));
 
-            // Energy-normalized shimmer transposer branch on odd lines.
+            // Energy-normalized shimmer transposer branch on odd lines, mixed
+            // as an equal-power PARALLEL send: the static tap always stays at
+            // full pre-normalization amplitude, so the reverb bed persists at
+            // any SHIMMER setting (a crossfade replaced the static tap
+            // entirely at 1.0, consuming the unshifted reverb within a few
+            // recirculations).  At full knob the odd lines split 50/50, i.e.
+            // a quarter of the network's recirculating energy is shifted per
+            // pass -- matching the density of pyFDN's 2-of-8 longest-channel
+            // configuration -- and each pass binomially splits energy across
+            // the octave ladder: the classic recursive shimmer cascade.
             if (i & 1) {
                 if (shimmer > 1e-4f) {
                     Cplx sh = shim[i].process(lines[i], delaySamp[i], shimRate,
                                               aEnv, aGain, tap);
-                    tap.re += shimmer * (sh.re - tap.re);
-                    tap.im += shimmer * (sh.im - tap.im);
+                    float norm = 1.f / std::sqrt(1.f + shimmer * shimmer);
+                    tap.re = (tap.re + shimmer * sh.re) * norm;
+                    tap.im = (tap.im + shimmer * sh.im) * norm;
                 } else {
                     shim[i].resetState();
                 }
