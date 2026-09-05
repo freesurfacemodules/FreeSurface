@@ -26,8 +26,13 @@ entries are stored complex for exactly this reason.
 - **CONJ**: blend toward conjugating the signal (x* e^{iψ}) rather than
   mirroring the phasor. Antiunitary (norm-preserving) at the endpoint:
   period-2 spectral ping-pong / reflection about Ω/2 instead of the MIRROR
-  knob's binomial diffusion. Needs the same freeze guard as MIRROR at
-  intermediate blends.
+  knob's binomial diffusion. Needs a freeze guard at intermediate blends.
+- **CHOP**: the coherent DSB multiplier (z = cos ψ + iλ sin ψ) that MIRROR
+  originally used — true ring-mod tremolo, beating sideband pairs. Replaced
+  in the main module by lossless stochastic frequency toggling after the
+  coherent form's |z| <= 1 loss killed the tail under diffusion (and its
+  make-up gain is parametrically unstable in-loop); worth exposing as a
+  flavor with the loss accepted, mirrored-subset + complex-C style.
 
 ## Nonlinearity layer
 - **GRAIN**: morph the shimmer read-pointer resets from periodic sawtooth to
@@ -40,6 +45,13 @@ entries are stored complex for exactly this reason.
   and reference (currently the static main tap) — turning the cap up /
   reference off recovers the un-normalized runaway snarl as a flavor.
 - **Per-line NL sends** g_i instead of the fixed odd-lines shimmer routing.
+
+## Absorption layer
+- **GEQ absorption**: per-line frequency-dependent T60 via a graphic-EQ
+  filter bank (pyFDN's `decay_to_geq` / `SOSBank`: ~10-band target RT,
+  e.g. 4.4 s at low frequencies tapering to 0.5 s at HF), replacing the
+  broadband gamma + shared one-pole DAMP. The two-stage attenuation filter
+  (Välimäki/Prawda/Schlecht, IEEE SPL 2024) is a cheaper alternative.
 
 ## I/O and quality
 - **Hilbert input option**: analytic-signal input for exact SSB on the first

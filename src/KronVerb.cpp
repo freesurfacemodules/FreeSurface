@@ -203,8 +203,15 @@ struct ShimmerTap {
         const float eps = 1e-12f;
         inPow = aEnv * inPow + (1.f - aEnv) * (ref.re * ref.re + ref.im * ref.im);
         outPow = aEnv * outPow + (1.f - aEnv) * (y.re * y.re + y.im * y.im);
+        // Attenuate-only (cap 1): a boosting cap turns the normalizer into a
+        // junk amplifier when the shifted content is annihilated -- with
+        // negative pitch the signal marches into the DC blocker within a few
+        // passes, outPow collapses, and a x4 cap then amplifies crossfade
+        // residue every pass (4 * gamma * eps > 1 self-oscillates).  In-loop,
+        // referenced to the main tap, the normalizer's job is purely
+        // protective: branch power <= reference power.
         float target = std::sqrt((inPow + eps) / (outPow + eps));
-        if (target > 4.f) target = 4.f;  // cap the boost; attenuation uncapped
+        if (target > 1.f) target = 1.f;
         comp = aGain * comp + (1.f - aGain) * target;
         return cscale(y, comp);
     }
@@ -280,7 +287,14 @@ struct KronVerbModule : Module {
     int delayInt[N] = {};      // integer part handed to the buffer read
 
     ShimmerTap shim[N];        // shimmer branch state (odd lines used)
-    float psi = 0.f;           // uniform phasor angle (SSB shift)
+
+    // Phasor layer state: per-line phase accumulators whose rates toggle
+    // under MIRROR (phase-continuous frequency switching).
+    float phTheta[N] = {};
+    float mirRate[N];          // smoothed per-line rate multiplier
+    int mirState[N];           // toggle bit per line
+    int mirTimer[N];           // samples until the next flip
+    uint32_t mirRng = 0x9e3779b9u;
     float driftPhase1 = 0.f;
     float driftPhase2 = 0.f;
 
@@ -330,6 +344,9 @@ struct KronVerbModule : Module {
         for (int i = 0; i < N; i++) {
             float chi = 2.f * (float)M_PI * std::fmod(0.61803398875f * (float)i, 1.f);
             cOut[i] = {std::cos(chi), std::sin(chi)};
+            mirRate[i] = 1.f;
+            mirState[i] = i & 1;             // start half the lines mirrored
+            mirTimer[i] = 977 * (i + 1);     // staggered first flips
         }
 
         onSampleRateChange();
@@ -407,34 +424,24 @@ struct KronVerbModule : Module {
         mixer.setRotation(2, thetaBase + driftAmt * std::sin(driftPhase2));
         mixer.setRotation(3, thetaBase);
 
-        // -- Phasor layer: weighted sideband pair per loop pass --------------
-        // z = cos(psi) + i*lambda*sin(psi) = (1+lambda)/2 e^{i psi}
-        //                                  + (1-lambda)/2 e^{-i psi}.
-        // lambda = 1 (MIRROR = 0): pure SSB shift, unimodular -- the spectrum
-        // advects by shiftHz per pass.  lambda = 0 (MIRROR = 1): true DSB ring
-        // mod -- each pass convolves the spectrum with {+shift, -shift}, so it
-        // diffuses (binomial spread) instead of drifting.  Deliberately NO
-        // power make-up: the paper's sqrt(2) ring-mod scaling is parametrically
-        // unstable inside the loop (packets whose loop period resonates with
-        // the modulation cross repeatedly near the cos peaks and pump without
-        // bound -- confirmed in the core tests), whereas |z| <= 1 keeps the
-        // tank unconditionally stable; MIRROR trades a little tail energy for
-        // the spectral diffusion, which lives in the convolution, not the
-        // gain.  The mirrored component is applied to the ODD lines only,
-        // matching pyFDN's practice of ring-modulating a channel subset
-        // (active_channels = half the lines): gating every line with the same
-        // phase nulls the whole tank and output at each cos zero crossing
-        // (deep amplitude swings), while the ungated half carries the sound
-        // through the nulls.  The even lines stay pure SSB, which also keeps
-        // the freezable partition exactly unimodular for any MIRROR setting.
-        psi += 2.f * (float)M_PI * shiftHz / fs;
-        if (psi > (float)M_PI) psi -= 2.f * (float)M_PI;
-        if (psi < -(float)M_PI) psi += 2.f * (float)M_PI;
-        float cps = std::cos(psi);
-        float sps = std::sin(psi);
-        float lamOdd = 1.f - mirror;
-        Cplx zOdd = {cps, lamOdd * sps};
-        Cplx zEven = {cps, sps};
+        // -- Phasor layer: per-line rates with MIRROR as frequency toggling --
+        // Each line has its own phase accumulator theta_i; z_i = e^{i theta_i}
+        // is exactly unimodular for every setting, so the phasor layer is
+        // lossless at any MIRROR/DIFFUSE combination (a coherent DSB
+        // multiplier z = cos + i*lambda*sin has |z| <= 1 and its ~ -6 dB/pass
+        // average loss killed the tail once diffusion mixed every packet
+        // through the mirrored lines; its make-up gain is parametrically
+        // unstable in-loop -- see the core tests).  MIRROR instead toggles
+        // each line's rate between +shift and (1 - 2*mirror)*shift at
+        // staggered random intervals (~100-300 ms), phase-continuously (an
+        // FSK glide, no clicks).  Recirculating packets accumulate a random
+        // +-shift step per pass, giving the same binomial spectral diffusion
+        // as true DSB -- mirrored sidebands appear across the line ensemble
+        // from the first pass -- without tremolo, interference collapse, or
+        // energy loss.  Being unimodular it is safe on the frozen partition:
+        // a frozen tank keeps diffusing spectrally, losslessly.
+        float kRate = 1.f - std::exp(-1.f / (fs * 0.01f));  // 10 ms rate slew
+        float phInc = 2.f * (float)M_PI * shiftHz / fs;
 
         // -- Damping coefficient ---------------------------------------------
         float dampA = std::exp(-2.f * (float)M_PI * dampFc / fs);
@@ -479,7 +486,20 @@ struct KronVerbModule : Module {
                 damped.re = damped.re + freeze * (tap.re - damped.re);
                 damped.im = damped.im + freeze * (tap.im - damped.im);
             }
-            v[i] = cscale(cmul(damped, (i & 1) ? zOdd : zEven), g);
+            if (--mirTimer[i] <= 0) {
+                mirRng ^= mirRng << 13;
+                mirRng ^= mirRng >> 17;
+                mirRng ^= mirRng << 5;
+                mirState[i] ^= 1;
+                mirTimer[i] = (int)(fs * (0.1f + 0.2f * (float)(mirRng >> 8) / 16777216.f));
+            }
+            float rTarget = 1.f - 2.f * mirror * (float)mirState[i];
+            mirRate[i] += kRate * (rTarget - mirRate[i]);
+            phTheta[i] += phInc * mirRate[i];
+            if (phTheta[i] > (float)M_PI) phTheta[i] -= 2.f * (float)M_PI;
+            if (phTheta[i] < -(float)M_PI) phTheta[i] += 2.f * (float)M_PI;
+            Cplx zi = {std::cos(phTheta[i]), std::sin(phTheta[i])};
+            v[i] = cscale(cmul(damped, zi), g);
         }
 
         // -- Unitary mixing ---------------------------------------------------
